@@ -23,6 +23,8 @@ actor_rollout_ref:
     rag_method: subgraph
     text_linking: False
     freeze_answer_api: False
+    set_llm_judge_model: False
+    llm_judge_model_name: Qwen/Qwen2.5-7B-Instruct # LLM model name for judging the generated answer
     iterative: False
     tight: False
     reward_function: deducible_reward # available: f1_reward, deducible_reward, recall_reward

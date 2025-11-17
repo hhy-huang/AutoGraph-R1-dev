@@ -21,7 +21,7 @@ argparser.add_argument("--use_upperbound", action="store_true", help="Use upperb
 # set store true if using dense retrieval only
 argparser.add_argument("--use_dense_only", action="store_true", help="Use dense retrieval only")
 args = argparser.parse_args()
-kg_names = ["2wikimultihopqa","musique", 'hotpotqa', '2021wiki']
+kg_names = ["musique","2wikimultihopqa", 'hotpotqa', '2021wiki']
 # kg_names = ['2021wiki']
 # kg_names = ['hotpotqa']
 # kg_names = ['2wikimultihopqa']
@@ -31,14 +31,14 @@ def main():
         # Load SentenceTransformer model
         encoder_model_name = "Qwen/Qwen3-Embedding-0.6B"
         sentence_model = OpenAI(
-            base_url="http://0.0.0.0:8130/v1",
+            base_url="http://0.0.0.0:8128/v1",
             api_key="EMPTY KEY",
         )
         sentence_encoder = Qwen3Emb(sentence_model)
 
         reader_model_name = "Qwen/Qwen2.5-7B-Instruct"
         client = OpenAI(
-            base_url="http://0.0.0.0:8131/v1",
+            base_url="http://0.0.0.0:8129/v1",
             api_key="EMPTY KEY",
         )
         llm_generator = LLMGenerator(client=client, model_name=reader_model_name)
@@ -77,7 +77,7 @@ def main():
                 base_dir = base_dir + "_dense"
             benchmark_config = BenchMarkConfig(
                 dataset_name=qa_name,
-                question_file=f"/home/knowcomp/projects/autograph-r1/benchmark/{qa_name}.json",
+                question_file=f"/home/tht/AutoGraph-R1/benchmark/{qa_name}.json",
                 result_dir=f"{base_dir}/benchmark/text_retrieval",
                 include_concept=False,
                 include_events=False,

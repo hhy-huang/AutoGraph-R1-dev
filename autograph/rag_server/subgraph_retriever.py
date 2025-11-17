@@ -19,13 +19,15 @@ def batch(iterable, n=100):
     for ndx in range(0, l, n):
         yield iterable[ndx:min(ndx + n, l)]
 class SubgraphRetriever(BaseRetriever):
-    def __init__(self, config: RetrieverConfig, llm_generator: LLMGenerator, reranker: Reranker):
+    def __init__(self, config: RetrieverConfig, llm_generator: LLMGenerator, reranker: Reranker, set_llm_judge_model: bool = False, llm_judge_generator: LLMGenerator = None):
         self.config = config
         self.llm_generator = llm_generator
         self.reranker = reranker
         self.KG = None
         self.node_embeddings = None
         self.num_hop = self.config.num_hop
+        self.set_llm_judge_model = set_llm_judge_model
+        self.llm_judge_generator = llm_judge_generator
 
     async def ner(self, text):
         """Extract topic entities from the query using LLM."""
@@ -236,7 +238,13 @@ class SubgraphRetriever(BaseRetriever):
         ]
         self.sampling_params["temperature"] = self.config.temperature_reasoning
         messages.append({"role": "user", "content": f"Knowledge graph (KG) context:{triples_string}\nQuestion:{query}\nTrue Answer:{answer}\nCan the true answer be deduced from the KG context? Answer 'Yes' or 'No' only."})
-        generated_text = await self.llm_generator.generate_response(messages, **self.sampling_params)
+        if self.set_llm_judge_model and self.llm_judge_generator:
+            sampling_params_backup = self.sampling_params
+            # assign response_format = None to avoid error in updated vllm version
+            sampling_params_backup["response_format"] = None
+            generated_text = await self.llm_judge_generator.generate_response(messages, **sampling_params_backup)
+        else:
+            generated_text = await self.llm_generator.generate_response(messages, **self.sampling_params)
         generated_text = generated_text.strip().lower()
         if "yes" in generated_text:
             generated_text = 'yes'

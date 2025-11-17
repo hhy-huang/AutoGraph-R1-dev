@@ -10,6 +10,7 @@ import jsonschema
 from transformers import AutoTokenizer
 from sglang.srt.sampling.sampling_params import SamplingParams
 import torch
+import traceback
 
 import time
 def serialize_openai_tool_call_message(message) -> dict:
@@ -127,7 +128,26 @@ class LLMGenerator():
 
         result = await self.client.async_generate(input_ids=prompt_ids, sampling_params=sampling_params, return_logprob=False)
         results.append(result)
-        output_text = results[-1]['text'] if results else ""
+        
+        # Handle different response structures from verl engine
+        if results:
+            last_result = results[-1]
+            if 'text' in last_result:
+                output_text = last_result['text']
+            elif 'content' in last_result:
+                output_text = last_result['content']
+            elif 'output_text' in last_result:
+                output_text = last_result['output_text']
+            else:
+                # Try to decode from output_ids if available
+                if 'output_ids' in last_result:
+                    output_ids = last_result['output_ids']
+                    output_text = self.tokenizer.decode(output_ids, skip_special_tokens=True)
+                else:
+                    print(f"Warning: Unexpected result structure from verl engine: {last_result.keys()}")
+                    output_text = ""
+        else:
+            output_text = ""
         content = output_text
         if return_text_only:
             return content
@@ -153,7 +173,7 @@ class LLMGenerator():
                         frequency_penalty, response_format, return_text_only, return_thinking, reasoning_effort, **kwargs
                     )
                 except Exception as e:
-                    print(f"Error processing message {i}: {e}")
+                    print(f"Error processing message {i}: {e} batch_messages: {batch_messages[i]}")
                     return ""
             tasks = [process_message(i) for i in to_process]
             results = await asyncio.gather(*tasks)
@@ -165,7 +185,8 @@ class LLMGenerator():
                         frequency_penalty, return_text_only, **kwargs
                     )
                 except Exception as e:
-                    print(f"Error processing message {i}: {e}")
+                    print(f"Error processing message {i}: {e}, batch_messages: {batch_messages[i]}")
+                    traceback.print_exc()
                     return ""
             tasks = [process_message(i) for i in to_process]
             results = await asyncio.gather(*tasks)

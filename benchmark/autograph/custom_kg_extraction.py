@@ -22,11 +22,11 @@ for keyword in keywords:
 
       filename_pattern = keyword
       checkpoint_path = args.model_name
-      input_directory = f'/home/knowcomp/projects/autograph-r1/benchmark/autograph/{keyword}'
+      input_directory = f'/home/tht/AutoGraph-R1/benchmark/autograph/{keyword}'
       if not checkpoint_path.startswith('/'):
             # HuggingFace model name pattern (e.g., "Qwen/Qwen2.5-3B-Instruct")
             model_short_name = checkpoint_path.split("/")[-1]
-            output_directory = f'/data/autograph/checkpoints/{model_short_name}/constructed_kg/{keyword}_output'
+            output_directory = f'/data/tht/AutoGraph-R1/checkpoints/{model_short_name}/constructed_kg/{keyword}_output'
       else:
             # Local checkpoint path
             output_directory = f'{checkpoint_path}/constructed_kg/{keyword}_output'
@@ -43,8 +43,8 @@ for keyword in keywords:
             max_workers=5,
             remove_doc_spaces=True, # For removing duplicated spaces in the document text
             include_concept=False, # Whether to include concept nodes and edges in the knowledge graph
-            triple_extraction_prompt_path='/home/knowcomp/projects/autograph-r1/benchmark/autograph/custom_prompt.json',
-            triple_extraction_schema_path='/home/knowcomp/projects/autograph-r1/benchmark/autograph/custom_schema.json',
+            triple_extraction_prompt_path='/home/tht/AutoGraph-R1/benchmark/autograph/custom_prompt.json',
+            triple_extraction_schema_path='/home/tht/AutoGraph-R1/benchmark/autograph/custom_schema.json',
             record=False, # Whether to record the results in a JSON file
       )
       kg_extractor = KnowledgeGraphExtractor(model=triple_generator, config=kg_extraction_config)
