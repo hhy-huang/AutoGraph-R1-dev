@@ -48,7 +48,7 @@ class LLMGenerator():
     async def _api_inference(self, message, max_new_tokens=8192,
                              temperature=0.7,
                              frequency_penalty=None,
-                             response_format={"type": "text"},
+                             response_format=None,
                              return_text_only=True,
                              return_thinking=False,
                              reasoning_effort=None,
@@ -74,13 +74,14 @@ class LLMGenerator():
             return response
         logprobs=kwargs.get('logprobs', False)
         top_logprobs=NOT_GIVEN if not logprobs else 0
+        # Do not send response_format to avoid triggering structured outputs in vLLM
         response = await self.client.chat.completions.create( 
             model=self.model_name,
             messages=serialize_message,
             max_tokens=max_new_tokens,
             temperature=temperature,
             frequency_penalty=NOT_GIVEN if frequency_penalty is None else frequency_penalty,
-            response_format=response_format if response_format is not None else {"type": "text"},
+            response_format=NOT_GIVEN,
             timeout=120,
             reasoning_effort=NOT_GIVEN if reasoning_effort is None else reasoning_effort,      
             logprobs=logprobs,
