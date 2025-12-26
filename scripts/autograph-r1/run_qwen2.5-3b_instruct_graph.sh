@@ -2,9 +2,15 @@
 # make sure your current working directory is the root of the project
 # export CUDA devices
 #!/bin/bash
-export NCCL_P2P_LEVEL=NVL
+export CUDA_VISIBLE_DEVICES=0,1
+export NCCL_P2P_DISABLE=1
 export CUDA_LAUNCH_BLOCKING=1
+export CUDA_DEVICE_MAX_CONNECTIONS=1
 export HYDRA_FULL_ERROR=1
+export HF_HOME=/data/haoyuhuang/data/model
+export RAY_TMPDIR=/data/haoyuhuang/ray_tmp
+mkdir -p "$RAY_TMPDIR"
+
 # export RAY_BACKEND_LOG_LEVEL=debug
 # export RAY_LOG_TO_STDERR=1
 # Function to get a value from the config file
@@ -42,22 +48,22 @@ MIX_DATA="True" # available: True, False
 DEDUCE_REWARD="True"
 ITERATIVE="True"
 
-TRAIN_DATA="/data/autograph/data/musique_train_doc_size_${DOC_SIZE}_distract_${WITH_DISTRACT}_with_mcq_False_difficulty_${DIFFFICULTY}_text_linking_${TEXT_LINKING}.parquet"
-VAL_DATA="/data/autograph/data/musique_validation_doc_size_${DOC_SIZE}_distract_${WITH_DISTRACT}_with_mcq_False_difficulty_${DIFFFICULTY}_text_linking_${TEXT_LINKING}.parquet"
+TRAIN_DATA="/data/haoyuhuang/data/AtlasTune/data/musique_train_doc_size_${DOC_SIZE}_distract_${WITH_DISTRACT}_with_mcq_False_difficulty_${DIFFFICULTY}_text_linking_${TEXT_LINKING}.parquet"
+VAL_DATA="/data/haoyuhuang/data/AtlasTune/data/musique_validation_doc_size_${DOC_SIZE}_distract_${WITH_DISTRACT}_with_mcq_False_difficulty_${DIFFFICULTY}_text_linking_${TEXT_LINKING}.parquet"
 
 MAX_ASSISTANT_TURN=2
 MAX_USER_TURN=2
 
 if [ "$MIX_DATA" = "True" ] && [ "$ITERATIVE" = "False" ]; then
     # Case 1: MIX_DATA=True, ITERATIVE=False
-    TRAIN_DATA="/data/autograph/data/mixed_hotpot_musique_train_doc_size_15_distract_${WITH_DISTRACT}.parquet"
-    VAL_DATA="/data/autograph/data/mixed_hotpot_musique_valid_doc_size_15_distract_${WITH_DISTRACT}.parquet"
+    TRAIN_DATA="/data/haoyuhuang/data/AtlasTune/data/mixed_hotpot_musique_train_doc_size_15_distract_${WITH_DISTRACT}.parquet"
+    VAL_DATA="/data/haoyuhuang/data/AtlasTune/data/mixed_hotpot_musique_valid_doc_size_15_distract_${WITH_DISTRACT}.parquet"
     DOC_SIZE="5"
 
 elif [ "$MIX_DATA" = "True" ] && [ "$ITERATIVE" = "True" ]; then
     # Case 2: MIX_DATA=True, ITERATIVE=True
-    TRAIN_DATA="/data/autograph/data/mixed_hotpot_musique_train_doc_size_15_distract_${WITH_DISTRACT}_iterate.parquet"
-    VAL_DATA="/data/autograph/data/mixed_hotpot_musique_valid_doc_size_15_distract_${WITH_DISTRACT}_iterate.parquet"
+    TRAIN_DATA="/data/haoyuhuang/data/AtlasTune/data/mixed_hotpot_musique_train_doc_size_15_distract_${WITH_DISTRACT}_iterate.parquet"
+    VAL_DATA="/data/haoyuhuang/data/AtlasTune/data/mixed_hotpot_musique_valid_doc_size_15_distract_${WITH_DISTRACT}_iterate.parquet"
     DOC_SIZE="15"
     MAX_ASSISTANT_TURN=16
     MAX_USER_TURN=16
@@ -65,7 +71,7 @@ fi
 
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 
-CHECKPOINT_DIR="/data/autograph/checkpoints/${TIMESTAMP}_qwen2.5-3B-autograph-${DIFFFICULTY}-docsize${DOC_SIZE}-textlinking${TEXT_LINKING}-loose"
+CHECKPOINT_DIR="/data/haoyuhuang/data/AtlasTune/checkpoints/${TIMESTAMP}_qwen2.5-3B-autograph-${DIFFFICULTY}-docsize${DOC_SIZE}-textlinking${TEXT_LINKING}-loose"
 
 if [ "$TEXT_LINKING" = "True" ]; then
     reward_fn_file_path="verl/third_party/autograph_r1/recall_reward.py"
@@ -88,8 +94,8 @@ python3 -m verl.trainer.main_ppo \
     algorithm.use_kl_in_reward=False \
     data.train_batch_size=64 \
     data.val_batch_size=64 \
-    data.max_prompt_length=8192 \
-    data.max_response_length=8192 \
+    data.max_prompt_length=2048 \
+    data.max_response_length=2048 \
     data.filter_overlong_prompts=True \
     data.shuffle=True \
     data.truncation='middle' \
@@ -110,8 +116,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.enable_activation_offload=True \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
-    actor_rollout_ref.rollout.max_num_batched_tokens=16384 \
-    actor_rollout_ref.rollout.max_model_len=16384 \
+    actor_rollout_ref.rollout.max_num_batched_tokens=4096 \
+    actor_rollout_ref.rollout.max_model_len=4096 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=sglang \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.25 \
@@ -123,12 +129,12 @@ python3 -m verl.trainer.main_ppo \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \
     trainer.val_before_train=False \
-    trainer.logger=['console','wandb'] \
+    trainer.logger=['console','swanlab'] \
     trainer.project_name='auto_graph_rl' \
     trainer.experiment_name="azure-qwen2.5-3B-auto-graph-rl-distract-${DIFFFICULTY}-docsize${DOC_SIZE}-text-linking${TEXT_LINKING}-deduce-${DEDUCE_REWARD}-loose" \
     trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \
-    trainer.total_training_steps=50 \
+    trainer.total_training_steps=1000 \
     trainer.save_freq=50 \
     trainer.test_freq=-1 \
     trainer.ray_wait_register_center_timeout=36000 \
@@ -144,5 +150,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.iterative=$ITERATIVE \
     actor_rollout_ref.rollout.tight=False \
     actor_rollout_ref.rollout.reward_function=$reward_function \
+    actor_rollout_ref.rollout.set_llm_judge_model=True \
+    actor_rollout_ref.rollout.llm_judge_model_name='Qwen/Qwen2.5-7B-Instruct' \
+    actor_rollout_ref.rollout.skip_tokenizer_init=False \
     custom_reward_function.reward_kwargs.triple_repetition_penalty=0.0
     

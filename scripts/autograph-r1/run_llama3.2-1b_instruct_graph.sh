@@ -2,9 +2,12 @@
 # make sure your current working directory is the root of the project
 # export CUDA devices
 #!/bin/bash
-export NCCL_P2P_LEVEL=NVL
+export CUDA_VISIBLE_DEVICES=1
+export NCCL_P2P_DISABLE=1
 export CUDA_LAUNCH_BLOCKING=1
+export CUDA_DEVICE_MAX_CONNECTIONS=1
 export HYDRA_FULL_ERROR=1
+export HF_HOME=/data/haoyuhuang/data/model
 # export RAY_BACKEND_LOG_LEVEL=debug
 # export RAY_LOG_TO_STDERR=1
 # Function to get a value from the config file
@@ -43,22 +46,22 @@ DEDUCE_REWARD="True"
 ITERATIVE="True"
 TIGHT="False" # available: True, False
 
-TRAIN_DATA="/data/autograph/data/musique_train_doc_size_${DOC_SIZE}_distract_${WITH_DISTRACT}_with_mcq_False_difficulty_${DIFFFICULTY}_text_linking_${TEXT_LINKING}.parquet"
-VAL_DATA="/data/autograph/data/musique_validation_doc_size_${DOC_SIZE}_distract_${WITH_DISTRACT}_with_mcq_False_difficulty_${DIFFFICULTY}_text_linking_${TEXT_LINKING}.parquet"
+TRAIN_DATA="/data/haoyuhuang/data/AtlasTune/data/musique_train_doc_size_${DOC_SIZE}_distract_${WITH_DISTRACT}_with_mcq_False_difficulty_${DIFFFICULTY}_text_linking_${TEXT_LINKING}.parquet"
+VAL_DATA="/data/haoyuhuang/data/AtlasTune/data/musique_validation_doc_size_${DOC_SIZE}_distract_${WITH_DISTRACT}_with_mcq_False_difficulty_${DIFFFICULTY}_text_linking_${TEXT_LINKING}.parquet"
 
 MAX_ASSISTANT_TURN=2
 MAX_USER_TURN=2
 
 if [ "$MIX_DATA" = "True" ] && [ "$ITERATIVE" = "False" ]; then
     # Case 1: MIX_DATA=True, ITERATIVE=False
-    TRAIN_DATA="/data/autograph/data/mixed_hotpot_musique_train_doc_size_15_distract_${WITH_DISTRACT}.parquet"
-    VAL_DATA="/data/autograph/data/mixed_hotpot_musique_valid_doc_size_15_distract_${WITH_DISTRACT}.parquet"
+    TRAIN_DATA="/data/haoyuhuang/data/AtlasTune/data/mixed_hotpot_musique_train_doc_size_15_distract_${WITH_DISTRACT}.parquet"
+    VAL_DATA="/data/haoyuhuang/data/AtlasTune/data/mixed_hotpot_musique_valid_doc_size_15_distract_${WITH_DISTRACT}.parquet"
     DOC_SIZE="5"
 
 elif [ "$MIX_DATA" = "True" ] && [ "$ITERATIVE" = "True" ]; then
     # Case 2: MIX_DATA=True, ITERATIVE=True
-    TRAIN_DATA="/data/autograph/data/mixed_hotpot_musique_train_doc_size_15_distract_${WITH_DISTRACT}_iterate.parquet"
-    VAL_DATA="/data/autograph/data/mixed_hotpot_musique_valid_doc_size_15_distract_${WITH_DISTRACT}_iterate.parquet"
+    TRAIN_DATA="/data/haoyuhuang/data/AtlasTune/data/mixed_hotpot_musique_train_doc_size_15_distract_${WITH_DISTRACT}_iterate.parquet"
+    VAL_DATA="/data/haoyuhuang/data/AtlasTune/data/mixed_hotpot_musique_valid_doc_size_15_distract_${WITH_DISTRACT}_iterate.parquet"
     DOC_SIZE="15"
     MAX_ASSISTANT_TURN=16
     MAX_USER_TURN=16
@@ -66,7 +69,7 @@ fi
 
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 
-CHECKPOINT_DIR="/data/autograph/checkpoints/${TIMESTAMP}_Meta-Llama-3.2-1B-Instruct-autograph-distract_${DIFFFICULTY}-docsize${DOC_SIZE}-textlinking${TEXT_LINKING}-f1${F1_REWARD}"
+CHECKPOINT_DIR="/data/haoyuhuang/data/AtlasTune/checkpoints/${TIMESTAMP}_Meta-Llama-3.2-1B-Instruct-autograph-${DIFFFICULTY}-docsize${DOC_SIZE}-textlinking${TEXT_LINKING}-loose"
 
 if [ "$TEXT_LINKING" = "True" ]; then
     reward_fn_file_path="verl/third_party/autograph_r1/recall_reward.py"
@@ -87,19 +90,19 @@ python3 -m verl.trainer.main_ppo \
     --config-name='autograph_multiturn_grpo' \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=False \
-    data.train_batch_size=64 \
-    data.val_batch_size=64 \
-    data.max_prompt_length=8192 \
-    data.max_response_length=8192 \
+    data.train_batch_size=1 \
+    data.val_batch_size=1 \
+    data.max_prompt_length=512 \
+    data.max_response_length=512 \
     data.filter_overlong_prompts=True \
     data.shuffle=True \
     data.truncation='middle' \
     data.return_raw_chat=True \
-    actor_rollout_ref.model.path=meta-llama/Llama-3.2-1B-Instruct \
+    actor_rollout_ref.model.path=unsloth/Llama-3.2-1B-Instruct \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.285 \
     actor_rollout_ref.model.use_remove_padding=True \
-    actor_rollout_ref.actor.ppo_mini_batch_size=2 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=1 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
@@ -111,12 +114,12 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.enable_activation_offload=True \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
-    actor_rollout_ref.rollout.max_num_batched_tokens=16384 \
-    actor_rollout_ref.rollout.max_model_len=16384 \
+    actor_rollout_ref.rollout.max_num_batched_tokens=1024 \
+    actor_rollout_ref.rollout.max_model_len=1024 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
-    actor_rollout_ref.rollout.name=sglang \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.25 \
-    actor_rollout_ref.rollout.n=5 \
+    actor_rollout_ref.rollout.name=vllm \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
+    actor_rollout_ref.rollout.n=1 \
     actor_rollout_ref.rollout.multi_turn.max_assistant_turns=$MAX_ASSISTANT_TURN \
     actor_rollout_ref.rollout.multi_turn.max_user_turns=$MAX_USER_TURN \
     actor_rollout_ref.rollout.multi_turn.interaction_config_path='config/interaction_config/autograph_interaction_config.yaml' \
@@ -124,10 +127,10 @@ python3 -m verl.trainer.main_ppo \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \
     trainer.val_before_train=False \
-    trainer.logger=['console','wandb'] \
+    trainer.logger=['console','swanlab'] \
     trainer.project_name='auto_graph_rl' \
     trainer.experiment_name="Meta-Llama-3.2-1B-Instruct-auto-graph-rl-distract-${DIFFFICULTY}-docsize${DOC_SIZE}-graph-retriever-deduce-${DEDUCE_REWARD}-tight-${TIGHT}" \
-    trainer.n_gpus_per_node=2 \
+    trainer.n_gpus_per_node=1 \
     trainer.nnodes=1 \
     trainer.total_training_steps=50 \
     trainer.save_freq=50 \

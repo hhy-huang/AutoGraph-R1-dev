@@ -5,6 +5,9 @@
 export NCCL_P2P_LEVEL=NVL
 export CUDA_LAUNCH_BLOCKING=1
 export HYDRA_FULL_ERROR=1
+export HF_HOME=/data/haoyuhuang/data/model
+export RAY_TMPDIR=/data/haoyuhuang/ray_tmp
+mkdir -p "$RAY_TMPDIR"
 # export RAY_BACKEND_LOG_LEVEL=debug
 # export RAY_LOG_TO_STDERR=1
 # Function to get a value from the config file
@@ -42,22 +45,22 @@ MIX_DATA="True" # available: True, False
 DEDUCE_REWARD="False"
 ITERATIVE="True"
 
-TRAIN_DATA="/data/autograph/data/musique_train_doc_size_${DOC_SIZE}_distract_${WITH_DISTRACT}_with_mcq_False_difficulty_${DIFFFICULTY}_text_linking_${TEXT_LINKING}.parquet"
-VAL_DATA="/data/autograph/data/musique_validation_doc_size_${DOC_SIZE}_distract_${WITH_DISTRACT}_with_mcq_False_difficulty_${DIFFFICULTY}_text_linking_${TEXT_LINKING}.parquet"
+TRAIN_DATA="/data/haoyuhuang/data/AtlasTune/data/musique_train_doc_size_${DOC_SIZE}_distract_${WITH_DISTRACT}_with_mcq_False_difficulty_${DIFFFICULTY}_text_linking_${TEXT_LINKING}.parquet"
+VAL_DATA="/data/haoyuhuang/data/AtlasTune/data/musique_validation_doc_size_${DOC_SIZE}_distract_${WITH_DISTRACT}_with_mcq_False_difficulty_${DIFFFICULTY}_text_linking_${TEXT_LINKING}.parquet"
 
 MAX_ASSISTANT_TURN=2
 MAX_USER_TURN=2
 
 if [ "$MIX_DATA" = "True" ] && [ "$ITERATIVE" = "False" ]; then
     # Case 1: MIX_DATA=True, ITERATIVE=False
-    TRAIN_DATA="/data/autograph/data/mixed_hotpot_musique_train_doc_size_15_distract_${WITH_DISTRACT}.parquet"
-    VAL_DATA="/data/autograph/data/mixed_hotpot_musique_valid_doc_size_15_distract_${WITH_DISTRACT}.parquet"
+    TRAIN_DATA="/data/haoyuhuang/data/AtlasTune/data/mixed_hotpot_musique_train_doc_size_15_distract_${WITH_DISTRACT}.parquet"
+    VAL_DATA="/data/haoyuhuang/data/AtlasTune/data/mixed_hotpot_musique_valid_doc_size_15_distract_${WITH_DISTRACT}.parquet"
     DOC_SIZE="5"
 
 elif [ "$MIX_DATA" = "True" ] && [ "$ITERATIVE" = "True" ]; then
     # Case 2: MIX_DATA=True, ITERATIVE=True
-    TRAIN_DATA="/data/autograph/data/mixed_hotpot_musique_train_doc_size_15_distract_${WITH_DISTRACT}_iterate.parquet"
-    VAL_DATA="/data/autograph/data/mixed_hotpot_musique_valid_doc_size_15_distract_${WITH_DISTRACT}_iterate.parquet"
+    TRAIN_DATA="/data/haoyuhuang/data/AtlasTune/data/mixed_hotpot_musique_train_doc_size_15_distract_${WITH_DISTRACT}_iterate.parquet"
+    VAL_DATA="/data/haoyuhuang/data/AtlasTune/data/mixed_hotpot_musique_valid_doc_size_15_distract_${WITH_DISTRACT}_iterate.parquet"
     DOC_SIZE="15"
     MAX_ASSISTANT_TURN=16
     MAX_USER_TURN=16
@@ -65,7 +68,7 @@ fi
 
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 
-CHECKPOINT_DIR="/data/autograph/checkpoints/${TIMESTAMP}_qwen2.5-3b-autograph-distract_${DIFFFICULTY}-docsize${DOC_SIZE}-textlinking${TEXT_LINKING}-hipporag2-tight"
+CHECKPOINT_DIR="/data/haoyuhuang/data/AtlasTune/checkpoints/${TIMESTAMP}_qwen2.5-3b-autograph-distract_${DIFFFICULTY}-docsize${DOC_SIZE}-textlinking${TEXT_LINKING}-hipporag2-tight"
 
 if [ "$TEXT_LINKING" = "True" ]; then
     reward_fn_file_path="verl/third_party/autograph_r1/recall_reward.py"
