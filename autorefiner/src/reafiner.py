@@ -119,13 +119,13 @@ class Reafiner:
                     head_node_str, rel, tail_node_str = triple_str.split("  ")
                     node_str_list.append(head_node_str)
                     node_str_list.append(tail_node_str)
-                node_str_list = list(set(node_str_list))
+                node_str_list = sorted(set(node_str_list))
                 node_id_list = [self.node_id_to_attr_id.get(node_str, node_str) for node_str in node_str_list]
                 # retrieve k-hop subgraph with the given node ids
                 subgraph = self.construct_subgraph(node_id_list, num_hop=self.increament_hop)
                 # convert subgraph to triple strings
                 subgraph_edges = len(subgraph.edges)
-                subgraph_triples = [(self.kg.nodes[u]['id'], d['relation'], self.kg.nodes[v]['id']) for u, v, d in subgraph.edges(data=True)]
+                subgraph_triples = sorted([(self.kg.nodes[u]['id'], d['relation'], self.kg.nodes[v]['id']) for u, v, d in subgraph.edges(data=True)])
                 sorted_context = [f"{s}  {r}  {o}" for s, r, o in subgraph_triples] 
 
             retrieved_context = "\n".join(sorted_context)
@@ -365,7 +365,7 @@ class Reafiner:
             if hop_count >= num_hop:
                 continue
             # Add successors (outgoing edges)
-            for neighbor in self.kg.successors(current_node):
+            for neighbor in sorted(self.kg.successors(current_node)):
                 neighbor_id = self.kg.nodes[neighbor].get('id', None)
                 if neighbor_id.isdigit():
                     # Do not further explore this neighbor
@@ -380,7 +380,7 @@ class Reafiner:
                 subgraph.add_edge(current_node, neighbor, relation=relation)
 
             # Add predecessors (incoming edges)
-            for neighbor in self.kg.predecessors(current_node):
+            for neighbor in sorted(self.kg.predecessors(current_node)):
                 neighbor_id = self.kg.nodes[neighbor].get('id', None)
                 if neighbor_id.isdigit():
                     # Do not further explore this neighbor
