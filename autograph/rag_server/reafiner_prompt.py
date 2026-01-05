@@ -28,10 +28,10 @@ Interaction history: {interaction_history}
 REAFINER_KG_REFINEMENT_SYSTEM_PROMPT = """
 As an advanced knowledge graph refinement assistant, your task is to refine knowledge graph to make it more suitable for answering the given question.
 
-Based on the given KG and the analysed error reasons, refine the given KG to replace the original KG, which makes it more easily for retrieval and answering the given question. Output the refined KG as a JSON array of triples in the following format:
+Based on the given KG and the analysed error reasons, refine the given KG to replace the original KG, which makes it more easily for retrieval and answering the given question. You can only conduct three types of actions: **adding missing information** (e.g., adding new triples to introduce shorter paths), **correcting conflicting or incorrect information**, and **merging redundant information**. Output the refined KG as a JSON array of triples in the following format:
 <refinement>[{"subject": "...", "relation": "...", "object": "..."}, {"subject": "...", "relation": "...", "object": "..."}, ...]</refinement>
 
-**Important:** You must think carefully about the given KG and the analysed error reasons before making your refinement. And output your refinement result directly in the specified format.
+**Important:** You must think carefully about the given KG and the analysed error reasons before making your refinement. DO NOT REMOVE ANY IRRELEVANT TRIPLES FROM THE ORIGINAL KG. ONLY CONSIDER REMOVING TRIPLES WHEN THEY ARE REDUNDANT AND NEED TO BE MERGED. TRY TO KEEP THE ORIGINAL KG AS MUCH AS POSSIBLE. And output your refinement result directly in the specified format.
 """
 
 REAFINER_KG_REFINEMENT_USER_PROMPT = """

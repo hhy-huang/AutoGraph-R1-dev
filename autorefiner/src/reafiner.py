@@ -5,6 +5,7 @@ import json
 import networkx as nx
 import numpy as np
 import faiss
+import json_repair
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple, Optional, Iterable, Set
 from atlas_rag.retriever.base import BaseEdgeRetriever, BasePassageRetriever
@@ -37,6 +38,18 @@ class RetrievalStepResult:
     answerable: bool
     answer: Optional[str] = None
 
+@dataclass
+class RefinementResult:
+    """
+    For single refinement result, for debugging / analysis.
+    """
+    query: str
+    history_horizon_size: int
+    interaction_history: List[RetrievalStepResult]
+    error_abduction_reason: str
+    original_subgraph: List[Dict[str, str]]
+    refined_subgraph: List[Dict[str, str]]
+
 
 class Reafiner:
     """
@@ -55,6 +68,7 @@ class Reafiner:
         base_top_k: int = 5,
         increament_hop: int = 1,
         max_hops: int = 4,
+        max_triple_num: int=25,
         history_horizon_size: int = 2,
         if_gen_answer: bool = True,
         seed: int = 2026,
@@ -70,6 +84,7 @@ class Reafiner:
         - sentence_encoder: Encoder corresponding to text_faiss_index, for encoding query.
         - llm_generator:    atlas_rag.llm_generator.LLMGenerator instance.
         - base_top_k:       TopK for text vector retrieval for the 1st step.
+        - max_triple_num:   Maximum number of triples for subgraph pruning.
         - if_gen_answer:    Whether to generate answer in the refinement process.
         - max_hops:         Maximum number of hops for subgraph expansion.
         - history_horizon_size: Size of the interaction history to be considered for error abduction.
@@ -92,6 +107,7 @@ class Reafiner:
         self.increament_hop = increament_hop
         self.history_horizon_size = history_horizon_size
         self.if_gen_answer = if_gen_answer
+        self.max_triple_num = max_triple_num
         self.seed = seed
         self._set_seed(seed)
         self._dim = self.data["text_faiss_index"].d
@@ -100,21 +116,37 @@ class Reafiner:
 
         self.node_id_to_attr_id = {self.kg.nodes[n]['id']: n for n in self.kg.nodes}
         self.qa_judge = QAJudger()
+        
+        # Initialize ID mapping tables (faiss_id -> list_index) for incremental updates without rebuild
+        # If mapping doesn't exist, create identity mapping (initial state: faiss_id == list_index)
+        if "edge_faiss_id_to_list_idx" not in self.data:
+            self.data["edge_faiss_id_to_list_idx"] = {i: i for i in range(len(self.edge_list))}
+        if "node_faiss_id_to_list_idx" not in self.data:
+            self.data["node_faiss_id_to_list_idx"] = {i: i for i in range(len(self.node_list))}
+        if "text_faiss_id_to_list_idx" not in self.data and "text_dict" in self.data:
+            self.data["text_faiss_id_to_list_idx"] = {i: i for i in range(len(self.data["text_dict"]))}
+        
+        self.edge_faiss_id_to_list_idx = self.data["edge_faiss_id_to_list_idx"]
+        self.node_faiss_id_to_list_idx = self.data["node_faiss_id_to_list_idx"]
+        if "text_faiss_id_to_list_idx" in self.data:
+            self.text_faiss_id_to_list_idx = self.data["text_faiss_id_to_list_idx"]
+        else:
+            self.text_faiss_id_to_list_idx = {}
 
     # ------------------------------------------------------------------
     # Main interface for external use
     # ------------------------------------------------------------------
     def refine(
-        self, query: str, return_steps: bool = False
-    ) -> Tuple[str, nx.DiGraph, Optional[List[RetrievalStepResult]]]:
+        self, query: str,
+    ) -> Tuple[str, nx.DiGraph, Optional[RefinementResult]]:
         """
         Run the entire REAfiner process for a single query.
 
         Returns:
         -------
-        - answer:       Answer given by LLM on the final refined KG (possibly abstract natural language).
-        - refined_kg:    KG after inserting new knowledge (in-place modification, also returned by reference).
-        - steps:        If return_steps=True, return a list of intermediate results for each step, for debugging/visualization.
+        - answer:             Answer given by LLM on the final refined KG (possibly abstract natural language).
+        - refined_kg:         KG after inserting new knowledge (in-place modification, also returned by reference).
+        - refinement_result:  Refinement result containing interaction history, original subgraph, and refined subgraph.
         """
         interaction_history: List[RetrievalStepResult] = []
         final_answer: str = ""
@@ -131,6 +163,9 @@ class Reafiner:
                 # obtain node ids from the previous step
                 node_str_list = []
                 for triple_str in sorted_context:
+                    if len(triple_str.split("  ")) != 3:
+                        print(f"Error: triple string {triple_str} is not in the correct format")
+                        continue
                     head_node_str, rel, tail_node_str = triple_str.split("  ")
                     node_str_list.append(head_node_str)
                     node_str_list.append(tail_node_str)
@@ -142,6 +177,8 @@ class Reafiner:
                 subgraph_edges = len(subgraph.edges)
                 subgraph_triples = sorted([(self.kg.nodes[u]['id'], d['relation'], self.kg.nodes[v]['id']) for u, v, d in subgraph.edges(data=True)])
                 sorted_context = [f"{s}  {r}  {o}" for s, r, o in subgraph_triples] 
+                if len(subgraph_triples) > self.max_triple_num:
+                    sorted_context = self._prune_subgraph(subgraph_triples, query)
             retrieved_context = "\n".join(sorted_context)
             retrieved_subgraph = [{"subject": f"{x.split('  ')[0]}", "relation": f"{x.split('  ')[1]}", "object": f"{x.split('  ')[2]}"} for x in sorted_context]
 
@@ -178,15 +215,36 @@ class Reafiner:
                         answer=short_answer if self.if_gen_answer else None,
                     )
                 )
-        # Error Abduction
-        error_abduction_reason, error_abduction_raw = self._error_abduction(interaction_history)
-        # Refined KG Generation
-        refined_subgraph, refined_subgraph_raw = self._kg_refinement(retrieved_subgraph, error_abduction_reason)
-        # del original smaller subgraph
-        self._del_subgraph(interaction_history[-2].retrieved_subgraph)
-        # insert refined larger subgraph
-        self._insert_subgraph(refined_subgraph)
-        return (interaction_history[-1].answer, self.data, interaction_history if return_steps else None)
+        if len(interaction_history) <= 1:
+            # 1-hop is enough to answer the query
+            refinement_result = RefinementResult(
+                query=query,
+                history_horizon_size=self.history_horizon_size,
+                interaction_history=interaction_history,
+                error_abduction_reason=None,
+                original_subgraph=interaction_history[-1].retrieved_subgraph,
+                refined_subgraph=None,
+            )
+            return (interaction_history[-1].answer, self.data, refinement_result)
+        else:
+            # Error Abduction
+            error_abduction_reason, error_abduction_raw = self._error_abduction(interaction_history)
+            # Refined KG Generation
+            refined_subgraph, refined_subgraph_raw = self._kg_refinement(interaction_history[-1].retrieved_subgraph, error_abduction_reason)
+            # del original smaller subgraph
+            self._del_subgraph(interaction_history[-2].retrieved_subgraph)
+            # insert refined larger subgraph
+            self._insert_subgraph(refined_subgraph)
+            # summarize the refinement result
+            refinement_result = RefinementResult(
+                query=query,
+                history_horizon_size=self.history_horizon_size,
+                interaction_history=interaction_history,
+                error_abduction_reason=error_abduction_reason,
+                original_subgraph=interaction_history[-1].retrieved_subgraph,
+                refined_subgraph=refined_subgraph,
+            )
+            return (interaction_history[-1].answer, self.data, refinement_result)
 
     def _set_seed(self, seed: int) -> None:
         random.seed(seed)
@@ -215,6 +273,34 @@ class Reafiner:
                 emb = padded
         faiss.normalize_L2(emb)
         return emb
+    
+    def _prune_subgraph(self, subgraph_triples: List[str], query: str) -> List[str]:
+        """
+        Prune the subgraph based on the given query.
+        """
+        # convert subgraph triples to edge strings for encoding (same format as simple_retriever)
+        subgraph_edge_strings = [f"{s} {r} {o}" for s, r, o in subgraph_triples]
+        # encode query and subgraph edges
+        query_embedding = self.sentence_encoder.encode([query], query_type='edge')
+        edge_embeddings = self.sentence_encoder.encode(subgraph_edge_strings, query_type='edge')
+        if isinstance(edge_embeddings, torch.Tensor):
+            edge_embeddings = edge_embeddings.cpu().numpy()
+        if isinstance(query_embedding, torch.Tensor):
+            query_embedding = query_embedding.cpu().numpy()
+        # compute similarity scores (same as simple_retriever's faiss search)
+        query_emb = query_embedding[0]
+        if query_emb.ndim == 1:
+            query_emb = query_emb.reshape(1, -1)
+        # normalize for cosine similarity (same as build_faiss_index)
+        faiss.normalize_L2(query_emb)
+        faiss.normalize_L2(edge_embeddings)
+        # compute cosine similarity
+        similarities = edge_embeddings @ query_emb.T
+        # get top-k indices
+        topk_indices = np.argsort(similarities.flatten())[-self.max_triple_num:][::-1]
+        # filter subgraph_triples and sorted_context
+        pruned_subgraph_triples = [f"{subgraph_triples[i][0]}  {subgraph_triples[i][1]}  {subgraph_triples[i][2]}" for i in topk_indices]
+        return pruned_subgraph_triples
 
     # ------------------------------------------------------------------
     # LLM interaction part
@@ -303,29 +389,30 @@ class Reafiner:
         if refinement_match:
             refinement_json = refinement_match.group(1).strip()
             try:
-                triples_list = json.loads(refinement_json)
-                for triple in triples_list:
-                    if isinstance(triple, dict):
-                        subject = triple.get("subject", "").strip()
-                        relation = triple.get("relation", "").strip()
-                        obj = triple.get("object", "").strip()
-                        if subject and relation and obj:
-                            refined_triples.append({"subject": subject, "relation": relation, "object": obj})
-                    else:
-                        # Fallback: try to parse as text format (head | relation | tail)
-                        for line in refinement_json.splitlines():
-                            line = line.strip()
-                            if not line or "|" not in line:
-                                continue
-                            parts = [p.strip() for p in line.split("|")]
-                            if len(parts) == 3:
-                                h, r, t = parts
-                                if h and r and t:
-                                    refined_triples.append({"subject": h, "relation": r, "object": t})
+                # try normal json.loads first
+                refined_triples = json.loads(refinement_json)
             except json.JSONDecodeError:
-                raise ValueError(f"KG Refinement Error Format: {raw}")
+                # if fails, try json_repair to fix common JSON issues (like invalid escape sequences)
+                try:
+                    refined_triples = json_repair.loads(refinement_json)
+                except Exception:
+                    raise ValueError(f"KG Refinement Error Format: {raw}")
         else:
-            raise ValueError(f"KG Refinement Error Format: {raw}")
+            # try to extract JSON from raw text if <refinement> tag not found
+            if '<refinement>' in raw:
+                refinement_json = raw.split('<refinement>')[1].split('</refinement>')[0].strip()
+            else:
+                raise ValueError(f"KG Refinement Error Format: {raw}")
+            
+            try:
+                # try normal json.loads first
+                refined_triples = json.loads(refinement_json)
+            except json.JSONDecodeError:
+                # if fails, try json_repair to fix common JSON issues (like invalid escape sequences)
+                try:
+                    refined_triples = json_repair.loads(refinement_json)
+                except Exception:
+                    raise ValueError(f"KG Refinement Error Format: {raw}")
         return refined_triples, raw
 
     def _generate_answer(self, query: str, subgraph_str: str) -> str:
@@ -345,84 +432,86 @@ class Reafiner:
         edges_to_delete = set()
         nodes_to_delete = set()
         for triple in retrieved_subgraph:
-            head_id = self._ensure_node(triple["subject"])
-            tail_id = self._ensure_node(triple["object"])
+            head_id = triple["subject"]
+            tail_id = triple["object"]
             edges_to_delete.add((head_id, tail_id))
             nodes_to_delete.add(head_id)
             nodes_to_delete.add(tail_id)
         # delete the nodes from the KG (will automatically delete the related edges)
         self.kg.remove_nodes_from(nodes_to_delete)
-        # find the indices of the edges to delete in the edge_list
+        
+        # find all edges that no longer exist in KG (including those deleted due to node removal)
+        # this is important because removing nodes automatically removes all connected edges
         edge_indices_to_delete = []
-        for i, edge in enumerate(self.edge_list):
-            if edge in edges_to_delete:
+        edge_embeddings = self.data["edge_embeddings"]
+        for i in range(len(self.edge_list) - 1, -1, -1):  # iterate backwards to safely delete
+            edge = self.edge_list[i]
+            # check if edge still exists in KG (both nodes exist and edge exists)
+            if (edge[0] not in self.kg.nodes or 
+                edge[1] not in self.kg.nodes or 
+                not self.kg.has_edge(edge[0], edge[1]) or
+                edge in edges_to_delete):
                 edge_indices_to_delete.append(i)
+        
         # find the indices of the nodes to delete in the node_list
         node_indices_to_delete = []
         for i, node_id in enumerate(self.node_list):
             if node_id in nodes_to_delete:
                 node_indices_to_delete.append(i)
-        # delete the edges and edge_embeddings from the edge_list and edge_embeddings
-        edge_embeddings = self.data["edge_embeddings"]
+        
+        # Use remove_ids for incremental deletion (no rebuild needed)
+        # Find FAISS IDs corresponding to list indices to delete
+        edge_faiss_ids_to_remove = []
+        for list_idx in edge_indices_to_delete:
+            # Find FAISS ID that maps to this list index
+            for faiss_id, mapped_list_idx in self.edge_faiss_id_to_list_idx.items():
+                if mapped_list_idx == list_idx:
+                    edge_faiss_ids_to_remove.append(faiss_id)
+                    break
+        
+        node_faiss_ids_to_remove = []
+        for list_idx in node_indices_to_delete:
+            # Find FAISS ID that maps to this list index
+            for faiss_id, mapped_list_idx in self.node_faiss_id_to_list_idx.items():
+                if mapped_list_idx == list_idx:
+                    node_faiss_ids_to_remove.append(faiss_id)
+                    break
+        
+        # Remove from FAISS index
+        if edge_faiss_ids_to_remove:
+            edge_ids_to_remove = np.array(edge_faiss_ids_to_remove, dtype=np.int64)
+            self.edge_faiss_index.remove_ids(edge_ids_to_remove)
+            # Remove from mapping table
+            for faiss_id in edge_faiss_ids_to_remove:
+                del self.edge_faiss_id_to_list_idx[faiss_id]
+            # Update remaining mappings: decrease list_idx for items after deleted ones
+            for faiss_id in self.edge_faiss_id_to_list_idx:
+                for deleted_list_idx in sorted(edge_indices_to_delete, reverse=True):
+                    if self.edge_faiss_id_to_list_idx[faiss_id] > deleted_list_idx:
+                        self.edge_faiss_id_to_list_idx[faiss_id] -= 1
+        
+        if node_faiss_ids_to_remove:
+            node_ids_to_remove = np.array(node_faiss_ids_to_remove, dtype=np.int64)
+            self.node_faiss_index.remove_ids(node_ids_to_remove)
+            # Remove from mapping table
+            for faiss_id in node_faiss_ids_to_remove:
+                del self.node_faiss_id_to_list_idx[faiss_id]
+            # Update remaining mappings: decrease list_idx for items after deleted ones
+            for faiss_id in self.node_faiss_id_to_list_idx:
+                for deleted_list_idx in sorted(node_indices_to_delete, reverse=True):
+                    if self.node_faiss_id_to_list_idx[faiss_id] > deleted_list_idx:
+                        self.node_faiss_id_to_list_idx[faiss_id] -= 1
+        
+        # Delete from lists (from back to front to avoid index shifting)
         for idx in sorted(edge_indices_to_delete, reverse=True):
             del self.edge_list[idx]
             del edge_embeddings[idx]
+        
         # delete the nodes and node_embeddings from the node_list and node_embeddings
         node_embeddings = self.data["node_embeddings"]
         for idx in sorted(node_indices_to_delete, reverse=True):
             del self.node_list[idx]
             del node_embeddings[idx]
-        
-        # rebuild faiss indices from updated embeddings (simple and reliable method)
-        # IndexHNSWFlat doesn't support remove_ids, so we rebuild the index
-        def rebuild_index(embeddings_list, original_index):
-            """Rebuild index from embeddings list, matching build_faiss_index style"""
-            if len(embeddings_list) == 0:
-                # return empty index with same dimension
-                dim = original_index.d
-                if isinstance(original_index, faiss.IndexHNSWFlat):
-                    return faiss.IndexHNSWFlat(dim, 64, faiss.METRIC_INNER_PRODUCT)
-                else:
-                    return faiss.IndexFlatL2(dim)
-            
-            # rebuild index matching build_faiss_index
-            vectors = np.array(embeddings_list, dtype=np.float32)
-            dim = vectors.shape[1]
-            
-            # match build_faiss_index: IndexHNSWFlat with METRIC_INNER_PRODUCT
-            if isinstance(original_index, faiss.IndexHNSWFlat):
-                new_index = faiss.IndexHNSWFlat(dim, 64, faiss.METRIC_INNER_PRODUCT)
-            else:
-                new_index = faiss.IndexFlatL2(dim)
-            
-            # normalize L2 (same as build_faiss_index)
-            faiss.normalize_L2(vectors)
-            
-            # batch add (same as build_faiss_index, batch size 32)
-            for i in tqdm(range(0, vectors.shape[0], 32), desc="Rebuilding index"):
-                new_index.add(vectors[i:i+32])
-            
-            return new_index
-        
-        # rebuild edge index
-        if edge_embeddings:
-            self.edge_faiss_index = rebuild_index(edge_embeddings, self.edge_faiss_index)
-        else:
-            dim = self.edge_faiss_index.d
-            if isinstance(self.edge_faiss_index, faiss.IndexHNSWFlat):
-                self.edge_faiss_index = faiss.IndexHNSWFlat(dim, 64, faiss.METRIC_INNER_PRODUCT)
-            else:
-                self.edge_faiss_index = faiss.IndexFlatL2(dim)
-        
-        # rebuild node index
-        if node_embeddings:
-            self.node_faiss_index = rebuild_index(node_embeddings, self.node_faiss_index)
-        else:
-            dim = self.node_faiss_index.d
-            if isinstance(self.node_faiss_index, faiss.IndexHNSWFlat):
-                self.node_faiss_index = faiss.IndexHNSWFlat(dim, 64, faiss.METRIC_INNER_PRODUCT)
-            else:
-                self.node_faiss_index = faiss.IndexFlatL2(dim)
         # delete text-related data if text_dict exists
         # NOTE: check text nodes BEFORE deleting from KG, since nodes are already deleted above
         if "text_dict" in self.data and self.data["text_dict"]:
@@ -449,9 +538,27 @@ class Reafiner:
             for idx in sorted(text_indices_to_delete, reverse=True):
                 if idx < len(text_embeddings):
                     del text_embeddings[idx]
-            # rebuild text_faiss_index if it exists
-            if text_faiss_index is not None:
-                text_faiss_index = rebuild_index(text_embeddings, text_faiss_index)
+            # Use remove_ids for incremental deletion of text index
+            if text_faiss_index is not None and text_indices_to_delete:
+                # Find FAISS IDs corresponding to list indices to delete
+                text_faiss_ids_to_remove = []
+                for list_idx in text_indices_to_delete:
+                    for faiss_id, mapped_list_idx in self.text_faiss_id_to_list_idx.items():
+                        if mapped_list_idx == list_idx:
+                            text_faiss_ids_to_remove.append(faiss_id)
+                            break
+                
+                if text_faiss_ids_to_remove:
+                    text_ids_to_remove = np.array(text_faiss_ids_to_remove, dtype=np.int64)
+                    text_faiss_index.remove_ids(text_ids_to_remove)
+                    # Remove from mapping table
+                    for faiss_id in text_faiss_ids_to_remove:
+                        del self.text_faiss_id_to_list_idx[faiss_id]
+                    # Update remaining mappings: decrease list_idx for items after deleted ones
+                    for faiss_id in self.text_faiss_id_to_list_idx:
+                        for deleted_list_idx in sorted(text_indices_to_delete, reverse=True):
+                            if self.text_faiss_id_to_list_idx[faiss_id] > deleted_list_idx:
+                                self.text_faiss_id_to_list_idx[faiss_id] -= 1
             # update data
             self.data["text_dict"] = text_dict
             self.data["text_embeddings"] = text_embeddings
@@ -464,7 +571,19 @@ class Reafiner:
         self.data["edge_embeddings"] = edge_embeddings
         self.data["node_embeddings"] = node_embeddings
         self.data["edge_list"] = self.edge_list
-        self.data["node_list"] = self.node_list        
+        self.data["node_list"] = self.node_list
+        # Update mapping tables in data
+        self.data["edge_faiss_id_to_list_idx"] = self.edge_faiss_id_to_list_idx
+        self.data["node_faiss_id_to_list_idx"] = self.node_faiss_id_to_list_idx
+        if hasattr(self, 'text_faiss_id_to_list_idx'):
+            self.data["text_faiss_id_to_list_idx"] = self.text_faiss_id_to_list_idx
+        
+        # update retriever's references to ensure it uses the latest data
+        self.retriever.KG = self.kg
+        self.retriever.edge_list = self.edge_list
+        self.retriever.node_list = self.node_list
+        self.retriever.edge_faiss_index = self.edge_faiss_index
+        self.retriever.node_faiss_index = self.node_faiss_index        
 
     def _insert_subgraph(
         self, refined_subgraph: List[Dict[str, str]]
@@ -475,27 +594,7 @@ class Reafiner:
         - If the edge already exists, only update the relation attribute.
         - Update edge_list, node_list, embeddings, and faiss indices.
         """
-        # helper function to ensure index is wrapped with IndexIDMap
-        def ensure_idmap(index, embeddings_list):
-            """Wrap index with IndexIDMap if not already wrapped, matching build_faiss_index style"""
-            if isinstance(index, faiss.IndexIDMap):
-                return index
-            elif isinstance(index, faiss.IndexIDMap2):
-                return index
-            else:
-                base_index = index
-                dim = base_index.d
-                if isinstance(base_index, faiss.IndexHNSWFlat):
-                    idmap = faiss.IndexIDMap(faiss.IndexHNSWFlat(dim, 64, faiss.METRIC_INNER_PRODUCT))
-                else:
-                    idmap = faiss.IndexIDMap(faiss.IndexFlatL2(dim))
-                if len(embeddings_list) > 0:
-                    vectors = np.array(embeddings_list, dtype=np.float32)
-                    faiss.normalize_L2(vectors)
-                    ids = np.arange(len(embeddings_list), dtype=np.int64)
-                    for i in range(0, vectors.shape[0], 32):
-                        idmap.add_with_ids(vectors[i:i+32], ids[i:i+32])
-                return idmap
+        # IndexIDMap is now used by default (from build_faiss_index), no need to wrap
         
         # collect new edges and nodes to insert
         new_edges = []
@@ -503,8 +602,12 @@ class Reafiner:
         new_text_nodes = []  # nodes with type "passage"
         
         for triple in refined_subgraph:
-            head_id = self._ensure_node(triple["subject"])
-            tail_id = self._ensure_node(triple["object"])
+            if "subject" in triple and "object" in triple:
+                head_id = self._ensure_node(triple["subject"])
+                tail_id = self._ensure_node(triple["object"])
+            else:
+                print(f"Error: subject or object not in triple {triple}")
+                continue
             
             # check if nodes are new
             if head_id not in self.node_list:
@@ -538,17 +641,28 @@ class Reafiner:
             if isinstance(new_edge_embeddings, torch.Tensor):
                 new_edge_embeddings = new_edge_embeddings.cpu().numpy()
             
+            # calculate start_list_idx and start_faiss_id before adding to lists
+            start_list_idx = len(self.edge_list)
+            # Use max existing FAISS ID + 1 as start, or 0 if empty
+            start_faiss_id = max(self.edge_faiss_id_to_list_idx.keys()) + 1 if self.edge_faiss_id_to_list_idx else 0
+            
             # add to edge_list and edge_embeddings
             for edge, emb in zip(new_edges, new_edge_embeddings):
                 self.edge_list.append(edge[:2])  # only (head, tail) tuple
                 edge_embeddings.append(emb.tolist())
             
-            # add new edge embeddings to index (simple method: just use add)
+            # add new edge embeddings to index with IDs (incremental update)
             new_edge_vectors = np.array(new_edge_embeddings, dtype=np.float32)
             faiss.normalize_L2(new_edge_vectors)
-            # batch add (batch size 32, matching build_faiss_index)
-            for i in tqdm(range(0, new_edge_vectors.shape[0], 32), desc="Adding new edge embeddings to index"):
-                self.edge_faiss_index.add(new_edge_vectors[i:i+32])
+            # batch add with IDs and update mapping table
+            for i in range(0, new_edge_vectors.shape[0], 32):
+                batch_end = min(i + 32, new_edge_vectors.shape[0])
+                faiss_ids = np.arange(start_faiss_id + i, start_faiss_id + batch_end, dtype=np.int64)
+                list_indices = range(start_list_idx + i, start_list_idx + batch_end)
+                self.edge_faiss_index.add_with_ids(new_edge_vectors[i:batch_end], faiss_ids)
+                # Update mapping table
+                for faiss_id, list_idx in zip(faiss_ids, list_indices):
+                    self.edge_faiss_id_to_list_idx[int(faiss_id)] = list_idx
             
             self.data["edge_embeddings"] = edge_embeddings
             self.data["edge_list"] = self.edge_list
@@ -564,17 +678,28 @@ class Reafiner:
             if isinstance(new_node_embeddings, torch.Tensor):
                 new_node_embeddings = new_node_embeddings.cpu().numpy()
             
+            # calculate start_list_idx and start_faiss_id before adding to lists
+            start_list_idx = len(self.node_list)
+            # Use max existing FAISS ID + 1 as start, or 0 if empty
+            start_faiss_id = max(self.node_faiss_id_to_list_idx.keys()) + 1 if self.node_faiss_id_to_list_idx else 0
+            
             # add to node_list and node_embeddings
             for node_id, emb in zip(new_nodes_list, new_node_embeddings):
                 self.node_list.append(node_id)
                 node_embeddings.append(emb.tolist())
             
-            # add new node embeddings to index (simple method: just use add)
+            # add new node embeddings to index with IDs (incremental update)
             new_node_vectors = np.array(new_node_embeddings, dtype=np.float32)
             faiss.normalize_L2(new_node_vectors)
-            # batch add (batch size 32, matching build_faiss_index)
-            for i in tqdm(range(0, new_node_vectors.shape[0], 32), desc="Adding new node embeddings to index"):
-                self.node_faiss_index.add(new_node_vectors[i:i+32])
+            # batch add with IDs and update mapping table
+            for i in range(0, new_node_vectors.shape[0], 32):
+                batch_end = min(i + 32, new_node_vectors.shape[0])
+                faiss_ids = np.arange(start_faiss_id + i, start_faiss_id + batch_end, dtype=np.int64)
+                list_indices = range(start_list_idx + i, start_list_idx + batch_end)
+                self.node_faiss_index.add_with_ids(new_node_vectors[i:batch_end], faiss_ids)
+                # Update mapping table
+                for faiss_id, list_idx in zip(faiss_ids, list_indices):
+                    self.node_faiss_id_to_list_idx[int(faiss_id)] = list_idx
             
             self.data["node_embeddings"] = node_embeddings
             self.data["node_list"] = self.node_list
@@ -592,18 +717,29 @@ class Reafiner:
             if isinstance(new_text_embeddings, torch.Tensor):
                 new_text_embeddings = new_text_embeddings.cpu().numpy()
             
+            # calculate start_list_idx and start_faiss_id before adding to lists
+            start_list_idx = len(text_embeddings)
+            # Use max existing FAISS ID + 1 as start, or 0 if empty
+            start_faiss_id = max(self.text_faiss_id_to_list_idx.keys()) + 1 if self.text_faiss_id_to_list_idx else 0
+            
             # add to text_dict and text_embeddings
             for node_id, text_content, emb in zip(new_text_nodes, text_list_string, new_text_embeddings):
                 text_dict[node_id] = text_content
                 text_embeddings.append(emb.tolist())
             
-            # add to text_faiss_index if it exists (simple method: just use add)
+            # add to text_faiss_index if it exists (incremental update with IDs)
             if text_faiss_index is not None:
                 new_text_vectors = np.array(new_text_embeddings, dtype=np.float32)
                 faiss.normalize_L2(new_text_vectors)
-                # batch add (batch size 32, matching build_faiss_index)
-                for i in tqdm(range(0, new_text_vectors.shape[0], 32), desc="Adding new text embeddings to index"):
-                    text_faiss_index.add(new_text_vectors[i:i+32])
+                # batch add with IDs and update mapping table
+                for i in range(0, new_text_vectors.shape[0], 32):
+                    batch_end = min(i + 32, new_text_vectors.shape[0])
+                    faiss_ids = np.arange(start_faiss_id + i, start_faiss_id + batch_end, dtype=np.int64)
+                    list_indices = range(start_list_idx + i, start_list_idx + batch_end)
+                    text_faiss_index.add_with_ids(new_text_vectors[i:batch_end], faiss_ids)
+                    # Update mapping table
+                    for faiss_id, list_idx in zip(faiss_ids, list_indices):
+                        self.text_faiss_id_to_list_idx[int(faiss_id)] = list_idx
                 self.data["text_faiss_index"] = text_faiss_index
             
             self.data["text_dict"] = text_dict
@@ -611,6 +747,22 @@ class Reafiner:
         
         # update KG in data
         self.data["KG"] = self.kg
+        
+        # Update mapping tables in data
+        self.data["edge_faiss_id_to_list_idx"] = self.edge_faiss_id_to_list_idx
+        self.data["node_faiss_id_to_list_idx"] = self.node_faiss_id_to_list_idx
+        if hasattr(self, 'text_faiss_id_to_list_idx'):
+            self.data["text_faiss_id_to_list_idx"] = self.text_faiss_id_to_list_idx
+        
+        # update retriever's references to ensure it uses the latest data
+        self.retriever.KG = self.kg
+        self.retriever.edge_list = self.edge_list
+        self.retriever.node_list = self.node_list
+        self.retriever.edge_faiss_index = self.edge_faiss_index
+        self.retriever.node_faiss_index = self.node_faiss_index
+        # Pass mapping tables to retriever
+        self.retriever.edge_faiss_id_to_list_idx = self.edge_faiss_id_to_list_idx
+        self.retriever.node_faiss_id_to_list_idx = self.node_faiss_id_to_list_idx
 
     def _ensure_node(self, entity_str: str) -> str:
         """
@@ -680,4 +832,4 @@ class Reafiner:
         return subgraph
 
 
-__all__ = ["Reafiner", "RetrievalStepResult"]
+__all__ = ["Reafiner", "RetrievalStepResult", "RefinementResult"]

@@ -16,7 +16,6 @@ import os
 import sys
 import json
 from dataclasses import asdict
-from tqdm import tqdm
 sys.path.append('/home/haoyuhuang/www/code/AutoGraph-R1-dev')
 from autorefiner.src.reafiner import Reafiner
 
@@ -69,35 +68,43 @@ def main():
                 normalize_embeddings=False,
                 text_batch_size=512,
                 node_and_edge_batch_size=512,
-                use_flat_index=True
             )
+        
+        # refine the graph
+        reafiner = Reafiner(
+                data=data,
+                sentence_encoder=sentence_encoder,
+                llm_generator=llm_generator,
+                max_hops=5,
+                max_triple_num=10,
+                history_horizon_size=3,
+                if_gen_answer=False
+            )
+        print(f"Draft graph: {data['KG']}")
+        print(f"node list: {len(reafiner.node_list)}")
+        final_answer, refined_kg_data, refinement_result = reafiner.refine(query="Who was the football manager that played in the Football League Cup in 1985 and managed to lead the Birmingham City Football Club's 103rd season to finish in the 18th position?")
+        print(f"Final answer: {final_answer}")
+        print(f"Refined graph: {refined_kg_data['KG']}")
+        # print(f"Step results: {step_results}")
+        print(f"\033[94m [Total Steps: {len(refinement_result.interaction_history)}] \033[0m")
+        # write step results to log file
+        with open(f"./refinement_result_0.json", "w") as f:
+            json.dump(asdict(refinement_result), f, indent=2, ensure_ascii=False)
+        print(f"node list: {len(reafiner.node_list)}")
+
+        final_answer, refined_kg_data, refinement_result = reafiner.refine(query="Who was the football manager that played in the Football League Cup in 1985 and managed to lead the Birmingham City Football Club's 103rd season to finish in the 18th position?")
+        print(f"Final answer: {final_answer}")
+        print(f"Refined graph: {refined_kg_data['KG']}")
+        with open(f"./refinement_result_1.json", "w") as f:
+            json.dump(asdict(refinement_result), f, indent=2, ensure_ascii=False)
+        print(f"\033[94m [Total Steps: {len(refinement_result.interaction_history)}] \033[0m")
+        exit(0)
         # Configure benchmarking
         if kg_name == "2021wiki":
             qa_names = ["nq", "popqa"]
         else:
             qa_names = [kg_name]
         for qa_name in qa_names:
-            # refine the KG
-            reafiner = Reafiner(
-                data=data,
-                sentence_encoder=sentence_encoder,
-                llm_generator=llm_generator,
-                max_hops=5,
-                max_triple_num=60,
-                history_horizon_size=3,
-                if_gen_answer=False
-            )
-            question_file=f"/home/haoyuhuang/www/code/AutoGraph-R1-dev/benchmark/{qa_name}.json"
-            with open(question_file, "r") as f:
-                query_data = json.load(f)
-                query_data = query_data[:1000] # only use the first 1000 samples
-            for sample in tqdm(query_data):
-                query = sample["question"]
-                final_answer, refined_kg_data, refinement_result = reafiner.refine(query=query)
-                print(f"Refined graph: {refined_kg_data['KG']}")
-                print(f"\033[94m [Total Steps: {len(refinement_result.interaction_history)}] \033[0m") # print the total number of steps
-            data = reafiner.data
-
             inference_config = InferenceConfig(keyword=qa_name)
             # get the parent directory of output_directory
             base_dir = '/'.join(output_directory.split('/')[:-2])
@@ -113,7 +120,7 @@ def main():
                 include_events=False,
                 reader_model_name=reader_model_name,
                 encoder_model_name=encoder_model_name,
-                number_of_samples=1000,  # -1 for all samples
+                number_of_samples=-1,  # -1 for all samples
                 upper_bound_mode=args.use_upperbound,
                 topN=10
             )
