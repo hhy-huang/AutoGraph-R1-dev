@@ -184,6 +184,29 @@ class Reafiner:
 
             # Answerable Judgement
             answerable, judgement_raw = self._answerable_judgement(query, retrieved_context)
+            if judgement_raw is None:
+                # fallback
+                interaction_history.append(
+                    RetrievalStepResult(
+                        num_hops=(step - 1) * self.increament_hop,
+                        base_top_k=base_top_k,
+                        query=query,
+                        retrieved_subgraph=retrieved_subgraph,
+                        raw_response=None,
+                        answerable=answerable,
+                        answer=None,
+                    )
+                )
+                refinement_result = RefinementResult(
+                    query=query,
+                    history_horizon_size=self.history_horizon_size,
+                    interaction_history=interaction_history,
+                    error_abduction_reason=None,
+                    original_subgraph=retrieved_subgraph,
+                    refined_subgraph=None,
+                )
+                return (interaction_history[-1].answer, self.data, refinement_result)
+
             if answerable:
                 if self.if_gen_answer:
                     final_answer = self._generate_answer(query, retrieved_context)
@@ -229,8 +252,30 @@ class Reafiner:
         else:
             # Error Abduction
             error_abduction_reason, error_abduction_raw = self._error_abduction(interaction_history)
+            if error_abduction_reason is None:
+                # fallback
+                refinement_result = RefinementResult(
+                    query=query,
+                    history_horizon_size=self.history_horizon_size,
+                    interaction_history=interaction_history,
+                    error_abduction_reason=error_abduction_reason,
+                    original_subgraph=interaction_history[-1].retrieved_subgraph,
+                    refined_subgraph=None,
+                )
+                return (interaction_history[-1].answer, self.data, refinement_result)
             # Refined KG Generation
             refined_subgraph, refined_subgraph_raw = self._kg_refinement(interaction_history[-1].retrieved_subgraph, error_abduction_reason)
+            if refined_subgraph_raw is None:
+                # fallback
+                refinement_result = RefinementResult(
+                    query=query,
+                    history_horizon_size=self.history_horizon_size,
+                    interaction_history=interaction_history,
+                    error_abduction_reason=error_abduction_reason,
+                    original_subgraph=interaction_history[-1].retrieved_subgraph,
+                    refined_subgraph=refined_subgraph,
+                )
+                return (interaction_history[-1].answer, self.data, refinement_result)
             # del original smaller subgraph
             self._del_subgraph(interaction_history[-2].retrieved_subgraph)
             # insert refined larger subgraph
@@ -323,9 +368,16 @@ class Reafiner:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
-        raw = self.llm_generator.generate_response(
-            messages, temperature=0.0
-        )
+        try:
+            raw = self.llm_generator.generate_response(
+                messages, temperature=0.0, max_new_tokens=256
+            )
+        except Exception as e:
+            # fallback
+            error_message = {"error": f"Answerable Judgement Generation Error: {e}"}
+            print(error_message)
+            return error_message['error'], None
+
         print(raw)
         # Parse the output: extract <judge> tag
         judge_match = re.search(r'<judge>(.*?)</judge>', raw, re.IGNORECASE | re.DOTALL)
@@ -339,6 +391,10 @@ class Reafiner:
                 answerable = True
             elif "no" in text_lower[:100]:
                 answerable = False
+            else:
+                error_message = [{"error": f"Answerable Judgement Error Format: {raw}"}]
+                print(error_message)
+                return error_message[0]['error'], None
         return answerable, raw
     
     def _error_abduction(self, interaction_history: List[RetrievalStepResult]) -> Tuple[str, str]:
@@ -356,15 +412,25 @@ class Reafiner:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
-        raw = self.llm_generator.generate_response(
-            messages, temperature=0.0
-        )
+        try:
+            raw = self.llm_generator.generate_response(
+                messages, temperature=0.0
+            )
+        except Exception as e:
+            # fallback
+            error_message = [{"error": f"Abduction Generation Error: {e}"}]
+            print(error_message)
+            return error_message[0]['error'], None
+
         # Parse the output: extract <abduction> tag
         abduction_match = re.search(r'<abduction>(.*?)</abduction>', raw, re.IGNORECASE | re.DOTALL)
         if abduction_match:
             reason = abduction_match.group(1).strip()
         else:
-            raise ValueError(f"Error Abduction Error Format: {raw}")
+            # fallback
+            error_message = [{"error": f"Error Abduction Error Format: {raw}"}]
+            print(error_message)
+            return error_message[0]['error'], None
         return reason, raw
     
     def _kg_refinement(self, triples_string: str, error_abduction_reason: str) -> Tuple[List[Dict[str, str]], str]:
@@ -380,9 +446,16 @@ class Reafiner:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
-        raw = self.llm_generator.generate_response(
-            messages, temperature=0.0
-        )
+        try:
+            raw = self.llm_generator.generate_response(
+                messages, temperature=0.0
+            )
+        except Exception as e:
+            # fallback
+            error_message = [{"error": f"Refinement Generation Error: {e}"}]
+            print(error_message)
+            return error_message, None
+
         # Parse the output: extract <refinement> tag
         refinement_match = re.search(r'<refinement>(.*?)</refinement>', raw, re.IGNORECASE | re.DOTALL)
         refined_triples = []
@@ -396,14 +469,19 @@ class Reafiner:
                 try:
                     refined_triples = json_repair.loads(refinement_json)
                 except Exception:
-                    raise ValueError(f"KG Refinement Error Format: {raw}")
+                    # fallback
+                    error_message = [{"error": f"KG Refinement Error Format: {raw}"}]
+                    print(error_message)
+                    return error_message, None
         else:
             # try to extract JSON from raw text if <refinement> tag not found
             if '<refinement>' in raw:
                 refinement_json = raw.split('<refinement>')[1].split('</refinement>')[0].strip()
             else:
-                raise ValueError(f"KG Refinement Error Format: {raw}")
-            
+                # fallback
+                error_message = [{"error": f"KG Refinement Error Format: {raw}"}]
+                print(error_message)
+                return error_message, None
             try:
                 # try normal json.loads first
                 refined_triples = json.loads(refinement_json)
@@ -412,7 +490,10 @@ class Reafiner:
                 try:
                     refined_triples = json_repair.loads(refinement_json)
                 except Exception:
-                    raise ValueError(f"KG Refinement Error Format: {raw}")
+                    # fallback
+                    error_message = [{"error": f"KG Refinement Error Format: {raw}"}]
+                    print(error_message)
+                    return error_message, None
         return refined_triples, raw
 
     def _generate_answer(self, query: str, subgraph_str: str) -> str:
@@ -602,11 +683,11 @@ class Reafiner:
         new_text_nodes = []  # nodes with type "passage"
         
         for triple in refined_subgraph:
-            if "subject" in triple and "object" in triple:
+            if "subject" in triple and "object" in triple and "relation" in triple:
                 head_id = self._ensure_node(triple["subject"])
                 tail_id = self._ensure_node(triple["object"])
             else:
-                print(f"Error: subject or object not in triple {triple}")
+                print(f"Error: subject or object or relation not in triple {triple}")
                 continue
             
             # check if nodes are new
