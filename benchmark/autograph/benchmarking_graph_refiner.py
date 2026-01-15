@@ -22,6 +22,7 @@ from autorefiner.src.reafiner import Reafiner
 
 argparser = argparse.ArgumentParser(description="Run Atlas Multi-hop QA Benchmark")
 argparser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-3B-Instruct", help="Keyword for extraction")
+argparser.add_argument("--refine", action="store_true", help="Refine the KG")
 argparser.add_argument("--port", type=int, default=8110, help="Port number for LLM server")
 # set store true if using upperbound retrieval
 argparser.add_argument("--use_upperbound", action="store_true", help="Use upperbound retrieval")
@@ -32,7 +33,7 @@ args = argparser.parse_args()
 # kg_names = ['2021wiki']
 # kg_names = ['hotpotqa']
 # kg_names = ['2021wiki']
-kg_names = ['hotpotqa']
+kg_names = ["hotpotqa", "hotpotqa", "hotpotqa"]
 def main():
     for kg_name in kg_names:
         # Load SentenceTransformer model
@@ -78,25 +79,45 @@ def main():
             qa_names = [kg_name]
         for qa_name in qa_names:
             # refine the KG
-            reafiner = Reafiner(
-                data=data,
-                sentence_encoder=sentence_encoder,
-                llm_generator=llm_generator,
-                max_hops=5,
-                max_triple_num=60,
-                history_horizon_size=3,
-                if_gen_answer=False
-            )
-            question_file=f"/home/haoyuhuang/www/code/AutoGraph-R1-dev/benchmark/{qa_name}.json"
-            with open(question_file, "r") as f:
-                query_data = json.load(f)
-                query_data = query_data[:1000] # only use the first 1000 samples
-            for sample in tqdm(query_data):
-                query = sample["question"]
-                final_answer, refined_kg_data, refinement_result = reafiner.refine(query=query)
-                print(f"Refined graph: {refined_kg_data['KG']}")
-                print(f"\033[94m [Total Steps: {len(refinement_result.interaction_history)}] \033[0m") # print the total number of steps
-            data = reafiner.data
+            if args.refine:
+                reafiner = Reafiner(
+                    data=data,
+                    sentence_encoder=sentence_encoder,
+                    llm_generator=llm_generator,
+                    max_hops=5,             # 5
+                    max_triple_num=20,      # 60
+                    history_horizon_size=3, # 3
+                    if_gen_answer=False
+                )
+                question_file=f"/home/haoyuhuang/www/code/AutoGraph-R1-dev/benchmark/{qa_name}.json"
+                with open(question_file, "r") as f:
+                    query_data = json.load(f)
+                    query_data = query_data[:100]
+                for sample in tqdm(query_data):
+                    query = sample["question"]
+                    final_answer, refined_kg_data, refinement_result = reafiner.refine(query=query)
+                    print(f"Refined KG: {reafiner.kg}")
+                    print(f"\033[94m [Total Steps: {len(refinement_result.interaction_history)}] \033[0m")
+                data = reafiner.data
+                # TODO: add the passage node to the KG
+                text_id_list = list(reafiner.text_id_to_node_name.keys())
+                for text_id in text_id_list:
+                    reafiner.kg.add_node(
+                        text_id,
+                        file_id=text_id,
+                        id=reafiner._safe_sanitize(reafiner.text_id_to_node_name[text_id]),
+                        type="passage"
+                    )
+                for node_id in list(reafiner.node_list):
+                    if reafiner.node_id_to_file_id[node_id] is not None:
+                        reafiner.kg.add_edge(
+                            node_id,
+                            reafiner.node_id_to_file_id[node_id],
+                            relation="mention in",
+                            type="Source"
+                        )
+                print(f"Refined KG (w/ passage nodes): {reafiner.kg}")
+                data['KG'] = reafiner.kg
 
             inference_config = InferenceConfig(keyword=qa_name)
             # get the parent directory of output_directory
@@ -113,7 +134,7 @@ def main():
                 include_events=False,
                 reader_model_name=reader_model_name,
                 encoder_model_name=encoder_model_name,
-                number_of_samples=1000,  # -1 for all samples
+                number_of_samples=100,  # -1 for all samples
                 upper_bound_mode=args.use_upperbound,
                 topN=10
             )

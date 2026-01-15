@@ -6,15 +6,18 @@ import networkx as nx
 import numpy as np
 import faiss
 import json_repair
+import hashlib
 from dataclasses import dataclass
-from typing import Any, Dict, List, Tuple, Optional, Iterable, Set
+from typing import Any, Dict, List, Tuple, Optional, Iterable, Set, Callable
 from atlas_rag.retriever.base import BaseEdgeRetriever, BasePassageRetriever
 from atlas_rag.llm_generator import LLMGenerator
 from atlas_rag.vectorstore.embedding_model import BaseEmbeddingModel
 from autograph.rag_server.reafiner_prompt import REAFINER_JUDGEMENT_SYSTEM_PROMPT, REAFINER_JUDGEMENT_USER_PROMPT, \
     REAFINER_ERROR_ABDUCTION_SYSTEM_PROMPT, REAFINER_ERROR_ABDUCTION_USER_PROMPT, \
     REAFINER_KG_REFINEMENT_SYSTEM_PROMPT, REAFINER_KG_REFINEMENT_USER_PROMPT, \
-    REFINE_SUBGRAPH_SYSTEM_PROMPT, REFINE_SUBGRAPH_USER_PROMPT
+    REFINE_SUBGRAPH_SYSTEM_PROMPT, REFINE_SUBGRAPH_USER_PROMPT, \
+    REAFINER_FILTERING_SYSTEM_PROMPT, REAFINER_FILTERING_USER_PROMPT, \
+    REAFINER_KG_REFINEMENT_ACTION_SYSTEM_PROMPT, REAFINER_KG_REFINEMENT_ACTION_USER_PROMPT
 from atlas_rag.retriever.simple_retriever import SimpleGraphRetriever
 from atlas_rag.evaluation.evaluation import QAJudger
 from networkx import DiGraph
@@ -24,6 +27,17 @@ try:
 except Exception:
     torch = None
 
+
+_ILLEGAL_XML_RE = re.compile(
+    "[" +
+    "\x00-\x08" +
+    "\x0B" +
+    "\x0C" +
+    "\x0E-\x1F" +
+    "\uD800-\uDFFF" +   # Surrogates
+    "\uFFFE\uFFFF" +    # Noncharacters
+    "]"
+)
 
 @dataclass
 class RetrievalStepResult:
@@ -49,6 +63,8 @@ class RefinementResult:
     error_abduction_reason: str
     original_subgraph: List[Dict[str, str]]
     refined_subgraph: List[Dict[str, str]]
+    refinement_action_list: List[Callable[[], None]]
+    refinement_action_raw: str
 
 
 class Reafiner:
@@ -65,7 +81,7 @@ class Reafiner:
         data: dict,
         sentence_encoder: BaseEmbeddingModel,
         llm_generator: LLMGenerator,
-        base_top_k: int = 5,
+        base_top_k: int = 10,
         increament_hop: int = 1,
         max_hops: int = 4,
         max_triple_num: int=25,
@@ -91,10 +107,12 @@ class Reafiner:
         """
         self.data = data
         self.kg = data["KG"]
-        self.node_list = data["node_list"]
-        self.edge_list = data["edge_list"]
-        self.node_faiss_index = data["node_faiss_index"]
-        self.edge_faiss_index = data["edge_faiss_index"]
+        self.node_list = data["node_list"]  # no passage nodes
+        self.edge_list = data["edge_list"]  # not include passage nodes
+        self.node_faiss_index = data["node_faiss_index"]    # no passage nodes
+        self.edge_faiss_index = data["edge_faiss_index"]    # not include passage nodes
+        self.node_embeddings = data["node_embeddings"]
+        self.edge_embeddings = data["edge_embeddings"]
         self.sentence_encoder = sentence_encoder
         self.llm_generator = llm_generator
         self.retriever = SimpleGraphRetriever(
@@ -114,9 +132,20 @@ class Reafiner:
         # Ensure the order of text_node_dict keys matches the order when building text_index (pickle maintains insertion order by default).
         self._text_node_ids: List[str] = list(self.data["text_dict"].keys())
 
+        node_id_to_file_id = {}
+        text_id_to_node_name = {}
+        for node_id in list(self.kg.nodes):
+            if self.kg.nodes[node_id]['type']=="passage":
+                text_id_to_node_name[node_id] = self.kg.nodes[node_id]["id"]
+            else:
+                node_id_to_file_id[node_id] = self.kg.nodes[node_id]["file_id"]
+        self.node_id_to_file_id = node_id_to_file_id        # node_id -> text id
+        self.text_id_to_node_name = text_id_to_node_name    # text_id -> text string
+        # filter out passage nodes - create a new mutable graph instead of a frozen view
+        self.kg = DiGraph(self.kg.subgraph(self.node_list))
         self.node_id_to_attr_id = {self.kg.nodes[n]['id']: n for n in self.kg.nodes}
         self.qa_judge = QAJudger()
-        
+        self.entity_to_id = {}
         # Initialize ID mapping tables (faiss_id -> list_index) for incremental updates without rebuild
         # If mapping doesn't exist, create identity mapping (initial state: faiss_id == list_index)
         if "edge_faiss_id_to_list_idx" not in self.data:
@@ -125,7 +154,6 @@ class Reafiner:
             self.data["node_faiss_id_to_list_idx"] = {i: i for i in range(len(self.node_list))}
         if "text_faiss_id_to_list_idx" not in self.data and "text_dict" in self.data:
             self.data["text_faiss_id_to_list_idx"] = {i: i for i in range(len(self.data["text_dict"]))}
-        
         self.edge_faiss_id_to_list_idx = self.data["edge_faiss_id_to_list_idx"]
         self.node_faiss_id_to_list_idx = self.data["node_faiss_id_to_list_idx"]
         if "text_faiss_id_to_list_idx" in self.data:
@@ -158,8 +186,18 @@ class Reafiner:
             if step == 1:
                 # base top-k edges retrieval for the 1st step
                 sorted_context, sorted_context_ids = self.retriever.retrieve(query, topN=base_top_k)
+                # subgraph_triples = sorted([(triple.split("  ")[0], triple.split("  ")[1], triple.split("  ")[2]) for triple in sorted_context])
             else:
                 # expand the sub-graph with k-hop retrieval
+                # # prune before expanding
+                # if len(subgraph_triples) > self.max_triple_num:
+                #     pruned_result = self._prune_subgraph_llm(subgraph_triples, query)
+                #     pruned_subgraph_triples, prune_raw = pruned_result
+                #     if prune_raw is not None:
+                #         sorted_context = pruned_subgraph_triples
+                #     else:
+                #         print(pruned_subgraph_triples)
+                #         pass
                 # obtain node ids from the previous step
                 node_str_list = []
                 for triple_str in sorted_context:
@@ -174,11 +212,10 @@ class Reafiner:
                 # retrieve k-hop subgraph with the given node ids
                 subgraph = self._construct_subgraph(node_id_list, num_hop=self.increament_hop)
                 # convert subgraph to triple strings
-                subgraph_edges = len(subgraph.edges)
                 subgraph_triples = sorted([(self.kg.nodes[u]['id'], d['relation'], self.kg.nodes[v]['id']) for u, v, d in subgraph.edges(data=True)])
                 sorted_context = [f"{s}  {r}  {o}" for s, r, o in subgraph_triples] 
                 if len(subgraph_triples) > self.max_triple_num:
-                    sorted_context = self._prune_subgraph(subgraph_triples, query)
+                    sorted_context = self._prune_subgraph_embd(subgraph_triples, query)
             retrieved_context = "\n".join(sorted_context)
             retrieved_subgraph = [{"subject": f"{x.split('  ')[0]}", "relation": f"{x.split('  ')[1]}", "object": f"{x.split('  ')[2]}"} for x in sorted_context]
 
@@ -204,6 +241,8 @@ class Reafiner:
                     error_abduction_reason=None,
                     original_subgraph=retrieved_subgraph,
                     refined_subgraph=None,
+                    refinement_action_list=[],
+                    refinement_action_raw=None,
                 )
                 return (interaction_history[-1].answer, self.data, refinement_result)
 
@@ -247,6 +286,8 @@ class Reafiner:
                 error_abduction_reason=None,
                 original_subgraph=interaction_history[-1].retrieved_subgraph,
                 refined_subgraph=None,
+                refinement_action_list=[],
+                refinement_action_raw=None,
             )
             return (interaction_history[-1].answer, self.data, refinement_result)
         else:
@@ -261,11 +302,14 @@ class Reafiner:
                     error_abduction_reason=error_abduction_reason,
                     original_subgraph=interaction_history[-1].retrieved_subgraph,
                     refined_subgraph=None,
+                    refinement_action_list=[],
+                    refinement_action_raw=None,
                 )
                 return (interaction_history[-1].answer, self.data, refinement_result)
             # Refined KG Generation
-            refined_subgraph, refined_subgraph_raw = self._kg_refinement(interaction_history[-1].retrieved_subgraph, error_abduction_reason)
-            if refined_subgraph_raw is None:
+            # refined_subgraph, refined_subgraph_raw = self._kg_refinement(interaction_history[-1].retrieved_subgraph, error_abduction_reason)
+            refinement_action_list, refinement_action_raw = self._kg_refinement_action(query, interaction_history[-1].retrieved_subgraph, error_abduction_reason)
+            if refinement_action_raw is None:
                 # fallback
                 refinement_result = RefinementResult(
                     query=query,
@@ -273,13 +317,14 @@ class Reafiner:
                     interaction_history=interaction_history,
                     error_abduction_reason=error_abduction_reason,
                     original_subgraph=interaction_history[-1].retrieved_subgraph,
-                    refined_subgraph=refined_subgraph,
+                    refined_subgraph=None,
+                    refinement_action_list=refinement_action_list,
+                    refinement_action_raw=refinement_action_raw,
                 )
                 return (interaction_history[-1].answer, self.data, refinement_result)
-            # del original smaller subgraph
-            self._del_subgraph(interaction_history[-2].retrieved_subgraph)
-            # insert refined larger subgraph
-            self._insert_subgraph(refined_subgraph)
+            # take actions
+            for action in refinement_action_list:
+                action()
             # summarize the refinement result
             refinement_result = RefinementResult(
                 query=query,
@@ -287,7 +332,9 @@ class Reafiner:
                 interaction_history=interaction_history,
                 error_abduction_reason=error_abduction_reason,
                 original_subgraph=interaction_history[-1].retrieved_subgraph,
-                refined_subgraph=refined_subgraph,
+                refined_subgraph=None,
+                refinement_action_list=refinement_action_list,
+                refinement_action_raw=refinement_action_raw,
             )
             return (interaction_history[-1].answer, self.data, refinement_result)
 
@@ -319,9 +366,67 @@ class Reafiner:
         faiss.normalize_L2(emb)
         return emb
     
-    def _prune_subgraph(self, subgraph_triples: List[str], query: str) -> List[str]:
+    def _prune_subgraph_llm(self, subgraph_triples: List[str], query: str) -> List[str]:
         """
-        Prune the subgraph based on the given query.
+        Prune the subgraph based on the LLM judgement.
+        """
+        system_prompt = REAFINER_FILTERING_SYSTEM_PROMPT
+        user_prompt = REAFINER_FILTERING_USER_PROMPT.format(
+            triples_string=subgraph_triples,
+            query=query,
+        )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        try:
+            raw = self.llm_generator.generate_response(
+                messages, temperature=0.0, max_new_tokens=8192
+            )
+        except Exception as e:
+            # fallback
+            error_message = {"error": f"Prune Subgraph LLM Error: {e}"}
+            print(error_message)
+            return error_message['error'], None
+        # Parse the output: extract <filtering> tag
+        filtering_match = re.search(r'<filtering>(.*?)</filtering>', raw, re.IGNORECASE | re.DOTALL)
+        if filtering_match:
+            filtering_text = filtering_match.group(1).strip()
+            try:
+                filtering_triples = json.loads(filtering_text)
+            except json.JSONDecodeError:
+                try:
+                    refined_triples = json_repair.loads(filtering_text)
+                except Exception:
+                    # fallback
+                    error_message = {"error": f"Filtering Subgraph LLM Error Format: {raw}"}
+                    print(error_message)
+                    return error_message['error'], None
+        else:
+            if '<filtering>' in raw:
+                filtering_text = raw.split('<filtering>')[1].split('</filtering>')[0].strip()
+            else:
+                # fallback
+                error_message = {"error": f"Filtering Subgraph LLM Error Format: {raw}"}
+                print(error_message)
+                return error_message['error'], None
+            try:
+                filtering_triples = json.loads(filtering_text)
+            except json.JSONDecodeError:
+                # if fails, try json_repair to fix common JSON issues (like invalid escape sequences)
+                try:
+                    filtering_triples = json_repair.loads(filtering_text)
+                except Exception:
+                    # fallback
+                    error_message = {"error": f"Filtering Subgraph LLM Error Format: {raw}"}
+                    print(error_message)
+                    return error_message['error'], None
+        pruned_subgraph_triples = [f"{triple['subject']}  {triple['relation']}  {triple['object']}" for triple in filtering_triples]
+        return pruned_subgraph_triples, raw
+    
+    def _prune_subgraph_embd(self, subgraph_triples: List[str], query: str) -> List[str]:
+        """
+        Prune the subgraph embedding similarity.
         """
         # convert subgraph triples to edge strings for encoding (same format as simple_retriever)
         subgraph_edge_strings = [f"{s} {r} {o}" for s, r, o in subgraph_triples]
@@ -432,6 +537,121 @@ class Reafiner:
             print(error_message)
             return error_message[0]['error'], None
         return reason, raw
+
+    def _parse_action_string(self, action: str) -> Tuple[str, List[str]]:
+        """
+        Parse an action string like 'insert_edge("subject", "relation", "object")'
+        Returns (function_name, [arg1, arg2, ...])
+        Handles entity names containing commas, parentheses, and quotes.
+        """
+        action = action.strip()
+        # Match function name and arguments
+        # Pattern: function_name("arg1", "arg2", ...) or function_name('arg1', 'arg2', ...)
+        pattern = r'(\w+)\s*\((.*)\)\s*$'
+        match = re.match(pattern, action)
+        if not match:
+            raise ValueError(f"Invalid action format: {action}")
+        function_name = match.group(1)
+        args_str = match.group(2).strip()
+        # Parse arguments by finding quoted strings (handles escaped quotes)
+        parsed_args = []
+        i = 0
+        while i < len(args_str):
+            # Skip whitespace and commas
+            while i < len(args_str) and args_str[i] in ' \t,':
+                i += 1
+            if i >= len(args_str):
+                break
+            # Determine quote type (single or double)
+            quote_char = args_str[i]
+            if quote_char not in ['"', "'"]:
+                raise ValueError(f"Expected quoted string at position {i} in: {action}")
+            i += 1  # Skip opening quote
+            arg_value = []
+            # Parse until matching closing quote (handling escaped quotes)
+            while i < len(args_str):
+                if args_str[i] == '\\' and i + 1 < len(args_str):
+                    # Escaped character
+                    arg_value.append(args_str[i + 1])
+                    i += 2
+                elif args_str[i] == quote_char:
+                    # Found closing quote
+                    parsed_args.append(''.join(arg_value))
+                    i += 1
+                    break
+                else:
+                    arg_value.append(args_str[i])
+                    i += 1
+            else:
+                # No closing quote found
+                raise ValueError(f"Unclosed quote in: {action}")
+        if not parsed_args:
+            raise ValueError(f"No valid arguments found in: {action}")
+        return function_name, parsed_args
+
+    def _kg_refinement_action(self, query: str, triples_string: str, error_abduction_reason: str) -> Tuple[List[str], str]:
+        """
+        Generate a series of actions to refine the knowledge graph based on the given error reasons.
+        """
+        system_prompt = REAFINER_KG_REFINEMENT_ACTION_SYSTEM_PROMPT
+        user_prompt = REAFINER_KG_REFINEMENT_ACTION_USER_PROMPT.format(
+            question=query,
+            triples_string=triples_string,
+            error_reasons=error_abduction_reason,
+        )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        try:
+            raw = self.llm_generator.generate_response(
+                messages, temperature=0.0
+            )
+        except Exception as e:
+            # fallback
+            error_message = [{"error": f"KG Refinement Action Generation Error: {e}"}]
+            print(error_message)
+            return error_message[0]['error'], None
+        # Parse the output: extract <refinement> tag
+        refinement_match = re.search(r'<refinement>(.*?)</refinement>', raw, re.IGNORECASE | re.DOTALL)
+        if refinement_match:
+            refinement_actions_str = refinement_match.group(1).strip().strip("|")
+            # parse action list and store function objects
+            refinement_action_list = []
+            for action in refinement_actions_str.split("|"):
+                action = action.strip()
+                if not action:
+                    continue
+                try:
+                    function_name, args = self._parse_action_string(action)
+                    
+                    if function_name == "insert_edge":
+                        if len(args) != 3:
+                            raise ValueError(f"insert_edge requires 3 arguments, got {len(args)}")
+                        sub, rel, obj = args[0], args[1], args[2]
+                        refinement_action_list.append(lambda s=sub, r=rel, o=obj: self._insert_edge(s, r, o))
+                    elif function_name == "delete_edge":
+                        if len(args) != 3:
+                            raise ValueError(f"delete_edge requires 3 arguments, got {len(args)}")
+                        sub, rel, obj = args[0], args[1], args[2]
+                        refinement_action_list.append(lambda s=sub, o=obj: self._delete_edge(s, o))
+                    elif function_name == "replace_node":
+                        if len(args) != 2:
+                            raise ValueError(f"replace_node requires 2 arguments, got {len(args)}")
+                        old_ent, new_ent = args[0], args[1]
+                        refinement_action_list.append(lambda old=old_ent, new=new_ent: self._replace_node(old, new))
+                    else:
+                        print(f"Error: Unknown action format: {function_name}")
+                        continue
+                except Exception as e:
+                    error_message = [{"error": f"KG Refinement Action Error Format: {action}, Error: {str(e)}"}]
+                    print(error_message)
+                    return error_message[0]['error'], None
+        else:
+            error_message = [{"error": f"KG Refinement Error Format: {raw}"}]
+            print(error_message)
+            return error_message[0]['error'], None
+        return refinement_action_list, raw
     
     def _kg_refinement(self, triples_string: str, error_abduction_reason: str) -> Tuple[List[Dict[str, str]], str]:
         """
@@ -496,373 +716,239 @@ class Reafiner:
                     return error_message, None
         return refined_triples, raw
 
+    # ------------------------------------------------------------------
+    # KG update logic
+    # ------------------------------------------------------------------
+    def _insert_edge(self, sub: str, rel: str, obj: str) -> None:
+        """
+        Insert an edge into the KG.
+        """
+        subject_mapped_id = self._get_node_id(sub, self.entity_to_id)
+        object_mapped_id = self._get_node_id(obj, self.entity_to_id)
+        new_node_list = []
+        # TODO: Add file_id to the node
+        if subject_mapped_id not in self.kg.nodes:
+            if subject_mapped_id not in self.node_id_to_file_id:
+                self.node_id_to_file_id[subject_mapped_id] = None
+            self.kg.add_node(
+                subject_mapped_id,
+                id=self._safe_sanitize(sub),
+                type="entity",
+                file_id=self.node_id_to_file_id[subject_mapped_id]
+            )
+            new_node_list.append(subject_mapped_id)
+        if object_mapped_id not in self.kg.nodes:
+            if object_mapped_id not in self.node_id_to_file_id:
+                self.node_id_to_file_id[object_mapped_id] = None
+            self.kg.add_node(
+                object_mapped_id,
+                id=self._safe_sanitize(obj),
+                type="entity",
+                file_id=self.node_id_to_file_id[object_mapped_id]
+            )
+            new_node_list.append(object_mapped_id)
+        if not self.kg.has_edge(subject_mapped_id, object_mapped_id):
+            self.kg.add_edge(
+                subject_mapped_id,
+                object_mapped_id,
+                relation=self._safe_sanitize(rel),
+                type="Relation"
+            )
+        # update the edge_list and edge_embeddings
+        if (subject_mapped_id, object_mapped_id) not in self.edge_list:
+            new_edge_embeddings = self.sentence_encoder.encode(f"{sub} {rel} {obj}", query_type="edge")
+            if isinstance(new_edge_embeddings, torch.Tensor):
+                new_edge_embeddings = new_edge_embeddings.cpu().numpy()
+            new_edge_faiss_embeddings = np.array(new_edge_embeddings).astype('float32')
+            # Reshape to 2D if needed (single vector should be shape [1, dim])
+            if new_edge_faiss_embeddings.ndim == 1:
+                new_edge_faiss_embeddings = new_edge_faiss_embeddings.reshape(1, -1)
+            faiss.normalize_L2(new_edge_faiss_embeddings)
+            next_faiss_id = max(self.edge_faiss_id_to_list_idx.keys()) + 1
+            self.edge_list.append((subject_mapped_id, object_mapped_id))
+            self.edge_embeddings.append(new_edge_embeddings)
+            self.edge_faiss_index.add_with_ids(new_edge_faiss_embeddings, np.array([next_faiss_id], dtype=np.int64))
+            self.edge_faiss_id_to_list_idx[next_faiss_id] = len(self.edge_list) - 1
+        # update the node_list and node_embeddings
+        if new_node_list:
+            new_node_embeddings = self.sentence_encoder.encode(new_node_list, query_type="node")
+            if isinstance(new_node_embeddings, torch.Tensor):
+                new_node_embeddings = new_node_embeddings.cpu().numpy()
+            new_node_faiss_embeddings = np.array(new_node_embeddings).astype('float32')
+            if new_node_faiss_embeddings.ndim == 1:
+                new_node_faiss_embeddings = new_node_faiss_embeddings.reshape(1, -1)
+            faiss.normalize_L2(new_node_faiss_embeddings)
+            next_faiss_id = max(self.node_faiss_id_to_list_idx.keys()) + 1 if self.node_faiss_id_to_list_idx else 0
+            start_list_idx = len(self.node_list)
+            self.node_list.extend(new_node_list)
+            self.node_embeddings.extend(new_node_embeddings)
+            faiss_ids = np.array(list(range(next_faiss_id, next_faiss_id + len(new_node_list))), dtype=np.int64)
+            self.node_faiss_index.add_with_ids(new_node_faiss_embeddings, faiss_ids)
+            for i, faiss_id in enumerate(faiss_ids):
+                self.node_faiss_id_to_list_idx[int(faiss_id)] = start_list_idx + i
+        # update the data
+        self.data["KG"] = self.kg
+        self.data["edge_list"] = self.edge_list
+        self.data["node_list"] = self.node_list
+        self.data["edge_embeddings"] = self.edge_embeddings
+        self.data["node_embeddings"] = self.node_embeddings
+        self.data["node_faiss_index"] = self.node_faiss_index
+        self.data["edge_faiss_index"] = self.edge_faiss_index
+        self.data["edge_faiss_id_to_list_idx"] = self.edge_faiss_id_to_list_idx
+        self.data["node_faiss_id_to_list_idx"] = self.node_faiss_id_to_list_idx
+        # update data in retriever
+        self.retriever.KG = self.kg
+        self.retriever.edge_list = self.edge_list
+        self.retriever.node_list = self.node_list
+        self.retriever.edge_faiss_index = self.edge_faiss_index
+        self.retriever.node_faiss_index = self.node_faiss_index
+        self.retriever.edge_faiss_id_to_list_idx = self.edge_faiss_id_to_list_idx
+        self.retriever.node_faiss_id_to_list_idx = self.node_faiss_id_to_list_idx
+
+    def _delete_edge(self, sub: str, obj: str) -> None:
+        """
+        Delete an edge from the KG.
+        """
+        subject_mapped_id = self._get_node_id(sub, self.entity_to_id)
+        object_mapped_id = self._get_node_id(obj, self.entity_to_id)
+        edge_tuple = (subject_mapped_id, object_mapped_id)
+        if not self.kg.has_edge(subject_mapped_id, object_mapped_id):
+            print("Action Error: Edge not found in KG: ", sub, obj)
+            return
+        # Find the index of the edge in edge_list
+        if edge_tuple not in self.edge_list:
+            print("Action Error: Edge not found in edge_list: ", sub, obj)
+            return
+        list_idx = self.edge_list.index(edge_tuple)
+        # Find the corresponding faiss_id by reverse lookup in mapping table
+        faiss_id_to_remove = None
+        for faiss_id, mapped_list_idx in self.edge_faiss_id_to_list_idx.items():
+            if mapped_list_idx == list_idx:
+                faiss_id_to_remove = faiss_id
+                break
+        if faiss_id_to_remove is None:
+            print("Action Error: FAISS ID not found for edge: ", sub, obj)
+            return
+        
+        # Remove edge from KG
+        self.kg.remove_edge(subject_mapped_id, object_mapped_id)
+        # Remove from FAISS index
+        self.edge_faiss_index.remove_ids(np.array([faiss_id_to_remove], dtype=np.int64))
+        # Remove from mapping table
+        del self.edge_faiss_id_to_list_idx[faiss_id_to_remove]
+        # Update remaining mappings: decrease list_idx for items after deleted one
+        deleted_set = {list_idx}
+        for faiss_id in self.edge_faiss_id_to_list_idx:
+            current_idx = self.edge_faiss_id_to_list_idx[faiss_id]
+            count_deleted_before = sum(1 for idx in deleted_set if idx < current_idx)
+            self.edge_faiss_id_to_list_idx[faiss_id] -= count_deleted_before
+        # Delete from lists (from back to front to avoid index shifting)
+        del self.edge_list[list_idx]
+        del self.edge_embeddings[list_idx]
+        # update the data
+        self.data["KG"] = self.kg
+        self.data["edge_faiss_index"] = self.edge_faiss_index
+        self.data["edge_list"] = self.edge_list
+        self.data["edge_embeddings"] = self.edge_embeddings
+        self.data["edge_faiss_id_to_list_idx"] = self.edge_faiss_id_to_list_idx
+        # update retriever
+        self.retriever.KG = self.kg
+        self.retriever.edge_list = self.edge_list
+        self.retriever.edge_faiss_index = self.edge_faiss_index
+        self.retriever.edge_faiss_id_to_list_idx = self.edge_faiss_id_to_list_idx
+
+    def _replace_node(self, old_entity: str, new_entity: str) -> None:
+        """
+        Replace a node in the KG.
+        """
+        old_mapped_id = self._get_node_id(old_entity, self.entity_to_id)
+        new_mapped_id = self._get_node_id(new_entity, self.entity_to_id)
+        if not self.kg.has_node(old_mapped_id):
+            print("Action Error: Node not found in KG: ", old_entity)
+            return
+        # obtain all edges connected to the old node, preserve for the new node
+        edges_to_preserve = []
+        edges_to_delete = []
+        for neighbor in sorted(self.kg.successors(old_mapped_id)):
+            neighbor_id = self.kg.nodes[neighbor].get("id", None)
+            if neighbor_id:
+                relation = self.kg.edges[old_mapped_id, neighbor]["relation"]
+                edges_to_preserve.append((new_entity, relation, neighbor_id))
+                edges_to_delete.append((old_entity, neighbor_id))
+        for neighbor in sorted(self.kg.predecessors(old_mapped_id)):
+            neighbor_id = self.kg.nodes[neighbor].get("id", None)
+            if neighbor_id:
+                relation = self.kg.edges[neighbor, old_mapped_id]["relation"]
+                edges_to_preserve.append((neighbor_id, relation, new_entity))
+                edges_to_delete.append((neighbor_id, old_entity))
+        # delete the original edges
+        for edge in edges_to_delete:
+            self._delete_edge(edge[0], edge[1])
+        # add the new edges and update the data
+        for edge in edges_to_preserve:
+            self._insert_edge(edge[0], edge[1], edge[2])
+        # delete the original node
+        self.kg.remove_node(old_mapped_id)
+        # update the node data
+        node_idx = self.node_list.index(old_mapped_id)
+        faiss_id_to_remove = None
+        for faiss_id, mapped_list_idx in self.node_faiss_id_to_list_idx.items():
+            if mapped_list_idx == node_idx:
+                faiss_id_to_remove = faiss_id
+                break
+        if faiss_id_to_remove is None:
+            print("Action Error: FAISS ID not found for node: ", old_entity)
+            return
+        # Remove from FAISS index
+        self.node_faiss_index.remove_ids(np.array([faiss_id_to_remove], dtype=np.int64))
+        # Remove from mapping table
+        del self.node_faiss_id_to_list_idx[faiss_id_to_remove]
+        # Update remaining mappings: decrease list_idx for items after deleted one
+        deleted_set = {node_idx}
+        for faiss_id in self.node_faiss_id_to_list_idx:
+            current_idx = self.node_faiss_id_to_list_idx[faiss_id]
+            count_deleted_before = sum(1 for idx in deleted_set if idx < current_idx)
+            self.node_faiss_id_to_list_idx[faiss_id] -= count_deleted_before
+        # Delete from lists (from back to front to avoid index shifting)
+        del self.node_list[node_idx]
+        del self.node_embeddings[node_idx]
+        # update the data
+        self.data["KG"] = self.kg
+        self.data["node_faiss_index"] = self.node_faiss_index
+        self.data["node_list"] = self.node_list
+        self.data["node_embeddings"] = self.node_embeddings
+        self.data["node_faiss_id_to_list_idx"] = self.node_faiss_id_to_list_idx
+        # update retriever
+        self.retriever.KG = self.kg
+        self.retriever.node_list = self.node_list
+        self.retriever.node_faiss_index = self.node_faiss_index
+        self.retriever.node_faiss_id_to_list_idx = self.node_faiss_id_to_list_idx
+
     def _generate_answer(self, query: str, subgraph_str: str) -> str:
         """
         Generate the final answer on the final refined subgraph (no Yes/No judgment).
         """
         return self.llm_generator.generate_with_context_kg(query, subgraph_str, temperature=0.0)
 
-    # ------------------------------------------------------------------
-    # KG update logic
-    # ------------------------------------------------------------------
-    def _del_subgraph(self, retrieved_subgraph: List[Dict[str, str]]) -> None:
-        """
-        Delete the retrieved subgraph from the KG and update corresponding indices.
-        """
-        # collect the edges and nodes to delete
-        edges_to_delete = set()
-        nodes_to_delete = set()
-        for triple in retrieved_subgraph:
-            head_id = triple["subject"]
-            tail_id = triple["object"]
-            edges_to_delete.add((head_id, tail_id))
-            nodes_to_delete.add(head_id)
-            nodes_to_delete.add(tail_id)
-        # delete the nodes from the KG (will automatically delete the related edges)
-        self.kg.remove_nodes_from(nodes_to_delete)
-        
-        # find all edges that no longer exist in KG (including those deleted due to node removal)
-        # this is important because removing nodes automatically removes all connected edges
-        edge_indices_to_delete = []
-        edge_embeddings = self.data["edge_embeddings"]
-        for i in range(len(self.edge_list) - 1, -1, -1):  # iterate backwards to safely delete
-            edge = self.edge_list[i]
-            # check if edge still exists in KG (both nodes exist and edge exists)
-            if (edge[0] not in self.kg.nodes or 
-                edge[1] not in self.kg.nodes or 
-                not self.kg.has_edge(edge[0], edge[1]) or
-                edge in edges_to_delete):
-                edge_indices_to_delete.append(i)
-        
-        # find the indices of the nodes to delete in the node_list
-        node_indices_to_delete = []
-        for i, node_id in enumerate(self.node_list):
-            if node_id in nodes_to_delete:
-                node_indices_to_delete.append(i)
-        
-        # Use remove_ids for incremental deletion (no rebuild needed)
-        # Find FAISS IDs corresponding to list indices to delete
-        edge_faiss_ids_to_remove = []
-        for list_idx in edge_indices_to_delete:
-            # Find FAISS ID that maps to this list index
-            for faiss_id, mapped_list_idx in self.edge_faiss_id_to_list_idx.items():
-                if mapped_list_idx == list_idx:
-                    edge_faiss_ids_to_remove.append(faiss_id)
-                    break
-        
-        node_faiss_ids_to_remove = []
-        for list_idx in node_indices_to_delete:
-            # Find FAISS ID that maps to this list index
-            for faiss_id, mapped_list_idx in self.node_faiss_id_to_list_idx.items():
-                if mapped_list_idx == list_idx:
-                    node_faiss_ids_to_remove.append(faiss_id)
-                    break
-        
-        # Remove from FAISS index
-        if edge_faiss_ids_to_remove:
-            edge_ids_to_remove = np.array(edge_faiss_ids_to_remove, dtype=np.int64)
-            self.edge_faiss_index.remove_ids(edge_ids_to_remove)
-            # Remove from mapping table
-            for faiss_id in edge_faiss_ids_to_remove:
-                del self.edge_faiss_id_to_list_idx[faiss_id]
-            # Update remaining mappings: decrease list_idx for items after deleted ones
-            for faiss_id in self.edge_faiss_id_to_list_idx:
-                for deleted_list_idx in sorted(edge_indices_to_delete, reverse=True):
-                    if self.edge_faiss_id_to_list_idx[faiss_id] > deleted_list_idx:
-                        self.edge_faiss_id_to_list_idx[faiss_id] -= 1
-        
-        if node_faiss_ids_to_remove:
-            node_ids_to_remove = np.array(node_faiss_ids_to_remove, dtype=np.int64)
-            self.node_faiss_index.remove_ids(node_ids_to_remove)
-            # Remove from mapping table
-            for faiss_id in node_faiss_ids_to_remove:
-                del self.node_faiss_id_to_list_idx[faiss_id]
-            # Update remaining mappings: decrease list_idx for items after deleted ones
-            for faiss_id in self.node_faiss_id_to_list_idx:
-                for deleted_list_idx in sorted(node_indices_to_delete, reverse=True):
-                    if self.node_faiss_id_to_list_idx[faiss_id] > deleted_list_idx:
-                        self.node_faiss_id_to_list_idx[faiss_id] -= 1
-        
-        # Delete from lists (from back to front to avoid index shifting)
-        for idx in sorted(edge_indices_to_delete, reverse=True):
-            del self.edge_list[idx]
-            del edge_embeddings[idx]
-        
-        # delete the nodes and node_embeddings from the node_list and node_embeddings
-        node_embeddings = self.data["node_embeddings"]
-        for idx in sorted(node_indices_to_delete, reverse=True):
-            del self.node_list[idx]
-            del node_embeddings[idx]
-        # delete text-related data if text_dict exists
-        # NOTE: check text nodes BEFORE deleting from KG, since nodes are already deleted above
-        if "text_dict" in self.data and self.data["text_dict"]:
-            text_dict = self.data["text_dict"]
-            text_embeddings = self.data.get("text_embeddings", [])
-            text_faiss_index = self.data.get("text_faiss_index")
-            # find text nodes to delete (nodes with type "passage" that are in nodes_to_delete)
-            # check nodes before they were deleted from KG
-            text_node_ids_to_delete = []
-            # we need to check nodes before deletion, so we'll check if they exist in text_dict and verify they were in nodes_to_delete
-            for text_node_id in list(text_dict.keys()):
-                if text_node_id in nodes_to_delete:
-                    text_node_ids_to_delete.append(text_node_id)
-            # find indices of text embeddings to delete text_embeddings order matches text_dict iteration order
-            text_indices_to_delete = []
-            for idx, (text_node_id, text_content) in enumerate(text_dict.items()):
-                if text_node_id in text_node_ids_to_delete:
-                    text_indices_to_delete.append(idx)
-            # delete from text_dict
-            for text_node_id in text_node_ids_to_delete:
-                if text_node_id in text_dict:
-                    del text_dict[text_node_id]
-            # delete from text_embeddings (from back to front to avoid index shifting)
-            for idx in sorted(text_indices_to_delete, reverse=True):
-                if idx < len(text_embeddings):
-                    del text_embeddings[idx]
-            # Use remove_ids for incremental deletion of text index
-            if text_faiss_index is not None and text_indices_to_delete:
-                # Find FAISS IDs corresponding to list indices to delete
-                text_faiss_ids_to_remove = []
-                for list_idx in text_indices_to_delete:
-                    for faiss_id, mapped_list_idx in self.text_faiss_id_to_list_idx.items():
-                        if mapped_list_idx == list_idx:
-                            text_faiss_ids_to_remove.append(faiss_id)
-                            break
-                
-                if text_faiss_ids_to_remove:
-                    text_ids_to_remove = np.array(text_faiss_ids_to_remove, dtype=np.int64)
-                    text_faiss_index.remove_ids(text_ids_to_remove)
-                    # Remove from mapping table
-                    for faiss_id in text_faiss_ids_to_remove:
-                        del self.text_faiss_id_to_list_idx[faiss_id]
-                    # Update remaining mappings: decrease list_idx for items after deleted ones
-                    for faiss_id in self.text_faiss_id_to_list_idx:
-                        for deleted_list_idx in sorted(text_indices_to_delete, reverse=True):
-                            if self.text_faiss_id_to_list_idx[faiss_id] > deleted_list_idx:
-                                self.text_faiss_id_to_list_idx[faiss_id] -= 1
-            # update data
-            self.data["text_dict"] = text_dict
-            self.data["text_embeddings"] = text_embeddings
-            if text_faiss_index is not None:
-                self.data["text_faiss_index"] = text_faiss_index
-        # update the lists in the data
-        self.data["KG"] = self.kg
-        self.data["node_faiss_index"] = self.node_faiss_index
-        self.data["edge_faiss_index"] = self.edge_faiss_index
-        self.data["edge_embeddings"] = edge_embeddings
-        self.data["node_embeddings"] = node_embeddings
-        self.data["edge_list"] = self.edge_list
-        self.data["node_list"] = self.node_list
-        # Update mapping tables in data
-        self.data["edge_faiss_id_to_list_idx"] = self.edge_faiss_id_to_list_idx
-        self.data["node_faiss_id_to_list_idx"] = self.node_faiss_id_to_list_idx
-        if hasattr(self, 'text_faiss_id_to_list_idx'):
-            self.data["text_faiss_id_to_list_idx"] = self.text_faiss_id_to_list_idx
-        
-        # update retriever's references to ensure it uses the latest data
-        self.retriever.KG = self.kg
-        self.retriever.edge_list = self.edge_list
-        self.retriever.node_list = self.node_list
-        self.retriever.edge_faiss_index = self.edge_faiss_index
-        self.retriever.node_faiss_index = self.node_faiss_index        
-
-    def _insert_subgraph(
-        self, refined_subgraph: List[Dict[str, str]]
-    ) -> None:
-        """
-        Insert the refined subgraph into the KG and update corresponding indices.
-        - If the entity node does not exist, create a new node, type is 'entity' by default.
-        - If the edge already exists, only update the relation attribute.
-        - Update edge_list, node_list, embeddings, and faiss indices.
-        """
-        # IndexIDMap is now used by default (from build_faiss_index), no need to wrap
-        
-        # collect new edges and nodes to insert
-        new_edges = []
-        new_nodes = set()
-        new_text_nodes = []  # nodes with type "passage"
-        
-        for triple in refined_subgraph:
-            if "subject" in triple and "object" in triple and "relation" in triple:
-                head_id = self._ensure_node(triple["subject"])
-                tail_id = self._ensure_node(triple["object"])
-            else:
-                print(f"Error: subject or object or relation not in triple {triple}")
-                continue
-            
-            # check if nodes are new
-            if head_id not in self.node_list:
-                new_nodes.add(head_id)
-                # check if it's a text node
-                if head_id in self.kg.nodes and "passage" in self.kg.nodes[head_id].get("type", ""):
-                    new_text_nodes.append(head_id)
-            if tail_id not in self.node_list:
-                new_nodes.add(tail_id)
-                # check if it's a text node
-                if tail_id in self.kg.nodes and "passage" in self.kg.nodes[tail_id].get("type", ""):
-                    new_text_nodes.append(tail_id)
-            
-            # add or update edge in KG
-            if self.kg.has_edge(head_id, tail_id):
-                self.kg.edges[head_id, tail_id]["relation"] = triple["relation"]
-            else:
-                self.kg.add_edge(head_id, tail_id, relation=triple["relation"])
-                # only add to new_edges if it's truly new
-                if (head_id, tail_id) not in self.edge_list:
-                    new_edges.append((head_id, tail_id, triple["relation"]))
-        
-        # generate embeddings for new edges
-        if new_edges:
-            edge_embeddings = self.data["edge_embeddings"]
-            edge_list_string = [
-                f"{self.kg.nodes[edge[0]]['id']} {edge[2]} {self.kg.nodes[edge[1]]['id']}"
-                for edge in new_edges
-            ]
-            new_edge_embeddings = self.sentence_encoder.encode(edge_list_string, query_type='edge')
-            if isinstance(new_edge_embeddings, torch.Tensor):
-                new_edge_embeddings = new_edge_embeddings.cpu().numpy()
-            
-            # calculate start_list_idx and start_faiss_id before adding to lists
-            start_list_idx = len(self.edge_list)
-            # Use max existing FAISS ID + 1 as start, or 0 if empty
-            start_faiss_id = max(self.edge_faiss_id_to_list_idx.keys()) + 1 if self.edge_faiss_id_to_list_idx else 0
-            
-            # add to edge_list and edge_embeddings
-            for edge, emb in zip(new_edges, new_edge_embeddings):
-                self.edge_list.append(edge[:2])  # only (head, tail) tuple
-                edge_embeddings.append(emb.tolist())
-            
-            # add new edge embeddings to index with IDs (incremental update)
-            new_edge_vectors = np.array(new_edge_embeddings, dtype=np.float32)
-            faiss.normalize_L2(new_edge_vectors)
-            # batch add with IDs and update mapping table
-            for i in range(0, new_edge_vectors.shape[0], 32):
-                batch_end = min(i + 32, new_edge_vectors.shape[0])
-                faiss_ids = np.arange(start_faiss_id + i, start_faiss_id + batch_end, dtype=np.int64)
-                list_indices = range(start_list_idx + i, start_list_idx + batch_end)
-                self.edge_faiss_index.add_with_ids(new_edge_vectors[i:batch_end], faiss_ids)
-                # Update mapping table
-                for faiss_id, list_idx in zip(faiss_ids, list_indices):
-                    self.edge_faiss_id_to_list_idx[int(faiss_id)] = list_idx
-            
-            self.data["edge_embeddings"] = edge_embeddings
-            self.data["edge_list"] = self.edge_list
-            self.data["edge_faiss_index"] = self.edge_faiss_index
-        
-        # generate embeddings for new nodes
-        if new_nodes:
-            node_embeddings = self.data["node_embeddings"]
-            # convert set to list to maintain order
-            new_nodes_list = list(new_nodes)
-            node_list_string = [self.kg.nodes[node_id]["id"] for node_id in new_nodes_list]
-            new_node_embeddings = self.sentence_encoder.encode(node_list_string, query_type='node')
-            if isinstance(new_node_embeddings, torch.Tensor):
-                new_node_embeddings = new_node_embeddings.cpu().numpy()
-            
-            # calculate start_list_idx and start_faiss_id before adding to lists
-            start_list_idx = len(self.node_list)
-            # Use max existing FAISS ID + 1 as start, or 0 if empty
-            start_faiss_id = max(self.node_faiss_id_to_list_idx.keys()) + 1 if self.node_faiss_id_to_list_idx else 0
-            
-            # add to node_list and node_embeddings
-            for node_id, emb in zip(new_nodes_list, new_node_embeddings):
-                self.node_list.append(node_id)
-                node_embeddings.append(emb.tolist())
-            
-            # add new node embeddings to index with IDs (incremental update)
-            new_node_vectors = np.array(new_node_embeddings, dtype=np.float32)
-            faiss.normalize_L2(new_node_vectors)
-            # batch add with IDs and update mapping table
-            for i in range(0, new_node_vectors.shape[0], 32):
-                batch_end = min(i + 32, new_node_vectors.shape[0])
-                faiss_ids = np.arange(start_faiss_id + i, start_faiss_id + batch_end, dtype=np.int64)
-                list_indices = range(start_list_idx + i, start_list_idx + batch_end)
-                self.node_faiss_index.add_with_ids(new_node_vectors[i:batch_end], faiss_ids)
-                # Update mapping table
-                for faiss_id, list_idx in zip(faiss_ids, list_indices):
-                    self.node_faiss_id_to_list_idx[int(faiss_id)] = list_idx
-            
-            self.data["node_embeddings"] = node_embeddings
-            self.data["node_list"] = self.node_list
-            self.data["node_faiss_index"] = self.node_faiss_index
-        
-        # handle new text nodes
-        if new_text_nodes and "text_dict" in self.data:
-            text_dict = self.data["text_dict"]
-            text_embeddings = self.data.get("text_embeddings", [])
-            text_faiss_index = self.data.get("text_faiss_index")
-            
-            # generate text embeddings for new text nodes
-            text_list_string = [self.kg.nodes[node_id]["id"] for node_id in new_text_nodes]
-            new_text_embeddings = self.sentence_encoder.encode(text_list_string, query_type='passage')
-            if isinstance(new_text_embeddings, torch.Tensor):
-                new_text_embeddings = new_text_embeddings.cpu().numpy()
-            
-            # calculate start_list_idx and start_faiss_id before adding to lists
-            start_list_idx = len(text_embeddings)
-            # Use max existing FAISS ID + 1 as start, or 0 if empty
-            start_faiss_id = max(self.text_faiss_id_to_list_idx.keys()) + 1 if self.text_faiss_id_to_list_idx else 0
-            
-            # add to text_dict and text_embeddings
-            for node_id, text_content, emb in zip(new_text_nodes, text_list_string, new_text_embeddings):
-                text_dict[node_id] = text_content
-                text_embeddings.append(emb.tolist())
-            
-            # add to text_faiss_index if it exists (incremental update with IDs)
-            if text_faiss_index is not None:
-                new_text_vectors = np.array(new_text_embeddings, dtype=np.float32)
-                faiss.normalize_L2(new_text_vectors)
-                # batch add with IDs and update mapping table
-                for i in range(0, new_text_vectors.shape[0], 32):
-                    batch_end = min(i + 32, new_text_vectors.shape[0])
-                    faiss_ids = np.arange(start_faiss_id + i, start_faiss_id + batch_end, dtype=np.int64)
-                    list_indices = range(start_list_idx + i, start_list_idx + batch_end)
-                    text_faiss_index.add_with_ids(new_text_vectors[i:batch_end], faiss_ids)
-                    # Update mapping table
-                    for faiss_id, list_idx in zip(faiss_ids, list_indices):
-                        self.text_faiss_id_to_list_idx[int(faiss_id)] = list_idx
-                self.data["text_faiss_index"] = text_faiss_index
-            
-            self.data["text_dict"] = text_dict
-            self.data["text_embeddings"] = text_embeddings
-        
-        # update KG in data
-        self.data["KG"] = self.kg
-        
-        # Update mapping tables in data
-        self.data["edge_faiss_id_to_list_idx"] = self.edge_faiss_id_to_list_idx
-        self.data["node_faiss_id_to_list_idx"] = self.node_faiss_id_to_list_idx
-        if hasattr(self, 'text_faiss_id_to_list_idx'):
-            self.data["text_faiss_id_to_list_idx"] = self.text_faiss_id_to_list_idx
-        
-        # update retriever's references to ensure it uses the latest data
-        self.retriever.KG = self.kg
-        self.retriever.edge_list = self.edge_list
-        self.retriever.node_list = self.node_list
-        self.retriever.edge_faiss_index = self.edge_faiss_index
-        self.retriever.node_faiss_index = self.node_faiss_index
-        # Pass mapping tables to retriever
-        self.retriever.edge_faiss_id_to_list_idx = self.edge_faiss_id_to_list_idx
-        self.retriever.node_faiss_id_to_list_idx = self.node_faiss_id_to_list_idx
-
-    def _ensure_node(self, entity_str: str) -> str:
-        """
-        Find / create a node in the graph based on the entity string.
-        Simplified strategy: If the node id == entity_str or the node attribute 'id' == entity_str, use it directly;
-        Otherwise create a new node with entity_str as id.
-        """
-        # Directly use id matching
-        if entity_str in self.kg:
-            return entity_str
-        # Match by node attribute 'id'
-        for nid, data in self.kg.nodes(data=True):
-            if data.get("id") == entity_str:
-                return nid
-
-        # If neither exists, create a new node, id is directly entity_str
-        node_id = entity_str
-        self.kg.add_node(node_id, id=entity_str, type="entity")
-        return node_id
+    def _get_node_id(self, entity_name, entity_to_id={}):
+        """Returns existing or creates new nX ID for an entity using a hash-based approach."""
+        if entity_name not in entity_to_id:
+            # Use a hash function to generate a unique ID
+            entity_name = entity_name+'_entity'
+            hash_object = hashlib.sha256(entity_name.encode('utf-8'))
+            hash_hex = hash_object.hexdigest()  # Get the hexadecimal representation of the hash
+            # Use the first 8 characters of the hash as the ID (you can adjust the length as needed)
+            entity_to_id[entity_name] = hash_hex
+        return entity_to_id[entity_name]
+    
+    def _safe_sanitize(self, value):
+        """Safely sanitize any value for XML output."""
+        def _sanitize_xml_string(s: str) -> str:
+            """Remove illegal XML characters from a string."""
+            return _ILLEGAL_XML_RE.sub("", s)
+        if value is None:
+            return ""
+        return _sanitize_xml_string(str(value))
     
     def _construct_subgraph(self, initial_nodes, num_hop: int = 1):
         """Construct a multi-hop subgraph around initial nodes up to num_hop."""

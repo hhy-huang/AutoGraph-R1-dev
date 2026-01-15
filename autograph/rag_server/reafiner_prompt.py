@@ -1,3 +1,31 @@
+REAFINER_FILTERING_SYSTEM_PROMPT = """
+As an advanced filtering assistant, your task is to filter the given triples based on the given query.
+
+Output your filtering result in the following format:
+<filtering>[{"subject": "...", "relation": "...", "object": "..."}, {"subject": "...", "relation": "...", "object": "..."}, ...]</filtering>
+
+**Important Filtering Rules:**
+1. **Be liberal in keeping triples**: When in doubt, KEEP the triple. It's better to keep potentially relevant triples than to remove them.
+2. **Entity matching rule**: If ANY entity (subject, object) in a triple appears in the query (exact match or semantically similar), you MUST keep that triple.
+3. **Semantic relevance**: Keep triples that are semantically related to the query, even if the connection is indirect.
+4. **Only remove clearly irrelevant triples**: Only filter out triples that are completely unrelated to the query topic and contain no entities or concepts mentioned in the query.
+5. You must think carefully about the query and the triples before making your filtering. And output your filtering result directly in the specified format. AND YOUR OUTPUT TRIPLES CAN NOT BE EMPTY.
+"""
+
+REAFINER_FILTERING_USER_PROMPT = """
+Filter the triples based on the given query. **Be very conservative in filtering - only remove triples that are clearly and completely irrelevant to the query.**
+
+**Key guidelines:**
+- Keep ALL triples where the subject or object entity appears in the query
+- Keep triples that are semantically related to the query topic
+- When uncertain about relevance, KEEP the triple
+- Only remove triples that are completely unrelated to the query
+
+Query: {query}
+Triples: {triples_string}
+Filtered Triples:
+"""
+
 REAFINER_JUDGEMENT_SYSTEM_PROMPT = """
 As an advanced judgement assistant, your task is to judge whether the given question is answerable based on the provided KG context.
 
@@ -23,6 +51,27 @@ Analyze the reasons of the unanswerable questions based on the given interaction
 
 REAFINER_ERROR_ABDUCTION_USER_PROMPT = """
 Interaction history: {interaction_history}
+"""
+
+REAFINER_KG_REFINEMENT_ACTION_SYSTEM_PROMPT = """
+As an advanced knowledge graph refinement assistant, your task is to generate a series of actions to refine the given KG to make it more suitable for answering the given question.
+
+Based on the given KG and the analysed error reasons, refine the given KG to make it more easily for retrieval and answering the given question. You have the following three types of actions to conduct:
+
+- insert_edge(subject, relation, object): Insert a new edge into the KG to complete the missing information.
+- delete_edge(subject, relation, object): Delete an edge from the KG to remove the redundant information or conflicting information.
+- replace_node(old_entity, new_entity): Replace an entity in the KG to correct the errors or deal with disambiguation.
+
+Output a series of actions in the following format:
+<refinement>insert_edge("...", "...", "...")|delete_edge("...", "...", "...")|replace_node("...", "...")|...</refinement>
+
+**Important:** You must think carefully about the given KG and the analysed error reasons before making your refinement. DO NOT DELETE ANY IRRELEVANT TRIPLES FROM THE ORIGINAL KG. TRY TO KEEP THE ORIGINAL KG AS MUCH AS POSSIBLE. And output your refinement result directly in the specified format.
+"""
+
+REAFINER_KG_REFINEMENT_ACTION_USER_PROMPT = """
+KG: {triples_string}
+Question: {question}
+Error reasons: {error_reasons}
 """
 
 REAFINER_KG_REFINEMENT_SYSTEM_PROMPT = """
