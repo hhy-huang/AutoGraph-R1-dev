@@ -307,7 +307,6 @@ class Reafiner:
                 )
                 return (interaction_history[-1].answer, self.data, refinement_result)
             # Refined KG Generation
-            # refined_subgraph, refined_subgraph_raw = self._kg_refinement(interaction_history[-1].retrieved_subgraph, error_abduction_reason)
             refinement_action_list, refinement_action_raw = self._kg_refinement_action(query, interaction_history[-1].retrieved_subgraph, error_abduction_reason)
             if refinement_action_raw is None:
                 # fallback
@@ -593,8 +592,16 @@ class Reafiner:
         """
         Generate a series of actions to refine the knowledge graph based on the given error reasons.
         """
+        text_set = set()
+        for triple in triples_string:
+            sub, rel, obj = triple['subject'], triple['relation'], triple['object']
+            if self.node_id_to_file_id[self._get_node_id(sub, self.entity_to_id)] is not None:
+                text_set.add(self.text_id_to_node_name[self.node_id_to_file_id[self._get_node_id(sub, self.entity_to_id)]])
+            if self.node_id_to_file_id[self._get_node_id(obj, self.entity_to_id)] is not None:
+                text_set.add(self.text_id_to_node_name[self.node_id_to_file_id[self._get_node_id(obj, self.entity_to_id)]])
         system_prompt = REAFINER_KG_REFINEMENT_ACTION_SYSTEM_PROMPT
         user_prompt = REAFINER_KG_REFINEMENT_ACTION_USER_PROMPT.format(
+            original_text=str(list(text_set)),
             question=query,
             triples_string=triples_string,
             error_reasons=error_abduction_reason,
@@ -624,7 +631,6 @@ class Reafiner:
                     continue
                 try:
                     function_name, args = self._parse_action_string(action)
-                    
                     if function_name == "insert_edge":
                         if len(args) != 3:
                             raise ValueError(f"insert_edge requires 3 arguments, got {len(args)}")
@@ -727,9 +733,13 @@ class Reafiner:
         object_mapped_id = self._get_node_id(obj, self.entity_to_id)
         new_node_list = []
         # TODO: Add file_id to the node
-        if subject_mapped_id not in self.kg.nodes:
-            if subject_mapped_id not in self.node_id_to_file_id:
+        # Ensure subject node is in node_id_to_file_id (even if already in KG)
+        if subject_mapped_id not in self.node_id_to_file_id:
+            if object_mapped_id in self.node_id_to_file_id:
+                self.node_id_to_file_id[subject_mapped_id] = self.node_id_to_file_id[object_mapped_id]
+            else:
                 self.node_id_to_file_id[subject_mapped_id] = None
+        if subject_mapped_id not in self.kg.nodes:
             self.kg.add_node(
                 subject_mapped_id,
                 id=self._safe_sanitize(sub),
@@ -737,9 +747,13 @@ class Reafiner:
                 file_id=self.node_id_to_file_id[subject_mapped_id]
             )
             new_node_list.append(subject_mapped_id)
-        if object_mapped_id not in self.kg.nodes:
-            if object_mapped_id not in self.node_id_to_file_id:
+        # Ensure object node is in node_id_to_file_id (even if already in KG)
+        if object_mapped_id not in self.node_id_to_file_id:
+            if subject_mapped_id in self.node_id_to_file_id:
+                self.node_id_to_file_id[object_mapped_id] = self.node_id_to_file_id[subject_mapped_id]
+            else:
                 self.node_id_to_file_id[object_mapped_id] = None
+        if object_mapped_id not in self.kg.nodes:
             self.kg.add_node(
                 object_mapped_id,
                 id=self._safe_sanitize(obj),
@@ -757,8 +771,7 @@ class Reafiner:
         # update the edge_list and edge_embeddings
         if (subject_mapped_id, object_mapped_id) not in self.edge_list:
             new_edge_embeddings = self.sentence_encoder.encode(f"{sub} {rel} {obj}", query_type="edge")
-            if isinstance(new_edge_embeddings, torch.Tensor):
-                new_edge_embeddings = new_edge_embeddings.cpu().numpy()
+            new_edge_embeddings = new_edge_embeddings.reshape(-1, )
             new_edge_faiss_embeddings = np.array(new_edge_embeddings).astype('float32')
             # Reshape to 2D if needed (single vector should be shape [1, dim])
             if new_edge_faiss_embeddings.ndim == 1:
@@ -774,14 +787,16 @@ class Reafiner:
             new_node_embeddings = self.sentence_encoder.encode(new_node_list, query_type="node")
             if isinstance(new_node_embeddings, torch.Tensor):
                 new_node_embeddings = new_node_embeddings.cpu().numpy()
-            new_node_faiss_embeddings = np.array(new_node_embeddings).astype('float32')
-            if new_node_faiss_embeddings.ndim == 1:
-                new_node_faiss_embeddings = new_node_faiss_embeddings.reshape(1, -1)
+            new_node_embeddings = np.array(new_node_embeddings)
+            if new_node_embeddings.ndim == 1:
+                new_node_embeddings = new_node_embeddings.reshape(1, -1)
+            new_node_embeddings_list = [emb.copy() for emb in new_node_embeddings]
+            new_node_faiss_embeddings = new_node_embeddings.astype('float32')
             faiss.normalize_L2(new_node_faiss_embeddings)
             next_faiss_id = max(self.node_faiss_id_to_list_idx.keys()) + 1 if self.node_faiss_id_to_list_idx else 0
             start_list_idx = len(self.node_list)
             self.node_list.extend(new_node_list)
-            self.node_embeddings.extend(new_node_embeddings)
+            self.node_embeddings.extend(new_node_embeddings_list)
             faiss_ids = np.array(list(range(next_faiss_id, next_faiss_id + len(new_node_list))), dtype=np.int64)
             self.node_faiss_index.add_with_ids(new_node_faiss_embeddings, faiss_ids)
             for i, faiss_id in enumerate(faiss_ids):
