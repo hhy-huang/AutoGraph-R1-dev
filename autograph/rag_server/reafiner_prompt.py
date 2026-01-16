@@ -69,6 +69,7 @@ Output a series of actions in the following format:
 """
 
 REAFINER_KG_REFINEMENT_ACTION_USER_PROMPT = """
+Original Text: {original_text}
 KG: {triples_string}
 Question: {question}
 Error reasons: {error_reasons}
