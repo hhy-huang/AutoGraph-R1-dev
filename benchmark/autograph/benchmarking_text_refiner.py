@@ -12,29 +12,28 @@ from atlas_rag.retriever.inference_config import InferenceConfig
 import torch
 import argparse
 import time
-import os
-import sys
 import json
 import pickle
-from dataclasses import asdict
+import sys
+import os
 from tqdm import tqdm
 sys.path.append('/home/haoyuhuang/www/code/AutoGraph-R1-dev')
 from autorefiner.src.reafiner import Reafiner
 
 argparser = argparse.ArgumentParser(description="Run Atlas Multi-hop QA Benchmark")
 argparser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-3B-Instruct", help="Keyword for extraction")
-argparser.add_argument("--refine", action="store_true", help="Refine the KG")
 argparser.add_argument("--port", type=int, default=8110, help="Port number for LLM server")
+argparser.add_argument("--refine", action="store_true", help="Refine the KG")
 # set store true if using upperbound retrieval
 argparser.add_argument("--use_upperbound", action="store_true", help="Use upperbound retrieval")
 # set store true if using dense retrieval only
 argparser.add_argument("--use_dense_only", action="store_true", help="Use dense retrieval only")
 args = argparser.parse_args()
-# kg_names = ["2wikimultihopqa","musique", 'hotpotqa', '2021wiki']
+kg_names = ["hotpotqa", "2021wiki", "musique", "2wikimultihopqa"]
 # kg_names = ['2021wiki']
 # kg_names = ['hotpotqa']
-# kg_names = ['2021wiki']
-kg_names = ["hotpotqa", "2wikimultihopqa", "musique", "2021wiki"]
+# kg_names = ['2wikimultihopqa']
+# kg_names = ['musique']
 def main():
     for kg_name in kg_names:
         # Load SentenceTransformer model
@@ -55,11 +54,9 @@ def main():
         checkpoint_path = args.model_name
         if checkpoint_path == "Qwen/Qwen2.5-3B-Instruct" or checkpoint_path == "Qwen/Qwen2.5-7B-Instruct" or checkpoint_path == 'meta-llama/Llama-3.2-3B-Instruct' or checkpoint_path == 'meta-llama/Llama-3.2-1B-Instruct':
         # get the name after '/'
-            output_directory = f'/data/haoyuhuang/data/AtlasTune/checkpoints/{checkpoint_path.split("/")[-1]}/constructed_kg/{kg_name}_output'
+            output_directory = f'/data/autograph/checkpoints/{checkpoint_path.split("/")[-1]}/constructed_kg/{kg_name}_output'
         else:
             output_directory = f'{checkpoint_path}/constructed_kg/{kg_name}_output'
-
-        # load graph data
         if not args.use_upperbound:
             data = create_embeddings_and_index(
                 sentence_encoder=sentence_encoder,
@@ -73,6 +70,7 @@ def main():
                 node_and_edge_batch_size=512,
                 use_flat_index=True
             )
+
         # Configure benchmarking
         if kg_name == "2021wiki":
             qa_names = ["nq", "popqa"]
@@ -82,6 +80,7 @@ def main():
             # refine the KG
             if args.refine:
                 if os.path.exists(f"{output_directory}/refined_kg.pkl"):
+                    print(f"\033[94m Found refined KG in {output_directory}/refined_kg.pkl \033[0m")
                     with open(f"{output_directory}/refined_kg.pkl", "rb") as f:
                         data = pickle.load(f)
                 else:
@@ -100,7 +99,7 @@ def main():
                         query_data = query_data[:1000]
                     for sample in tqdm(query_data):
                         query = sample["question"]
-                        final_answer, refined_kg_data, refinement_result = reafiner.refine(query=query, sampling_params={"temperature": 0.0})
+                        final_answer, refined_kg_data, refinement_result = reafiner.refine(query=query)
                         print(f"Refined KG: {reafiner.kg}")
                         print(f"\033[94m [Total Steps: {len(refinement_result.interaction_history)}] \033[0m")
                     data = reafiner.data
@@ -125,12 +124,12 @@ def main():
                     data['KG'] = reafiner.kg
                 # save the data file for repeatedly using
                 # Use pickle to save complex objects (NetworkX graph, FAISS indices, numpy arrays)
-                if args.refine:
+                if not os.path.exists(f"{output_directory}/refined_kg.pkl"):
                     with open(f"{output_directory}/refined_kg.pkl", "wb") as f:
                         pickle.dump(data, f)
                     print(f"Refined KG data saved to {output_directory}/refined_kg.pkl")
 
-            inference_config = InferenceConfig(keyword=qa_name)
+            inference_config = InferenceConfig(keyword=qa_name, ppr_max_iter=10000, weight_adjust=0.01, is_filter_edges=False)
             # get the parent directory of output_directory
             base_dir = '/'.join(output_directory.split('/')[:-2])
             if args.use_upperbound:
@@ -140,20 +139,17 @@ def main():
             benchmark_config = BenchMarkConfig(
                 dataset_name=qa_name,
                 question_file=f"/home/haoyuhuang/www/code/AutoGraph-R1-dev/benchmark/{qa_name}.json",
-                result_dir=f"{base_dir}/benchmark/graph_retrieval",
+                result_dir=f"{base_dir}/benchmark/text_retrieval",
                 include_concept=False,
                 include_events=False,
                 reader_model_name=reader_model_name,
                 encoder_model_name=encoder_model_name,
                 number_of_samples=1000,  # -1 for all samples
                 upper_bound_mode=args.use_upperbound,
-                topN=10
             )
             # Set up logger
             logger = setup_logger(benchmark_config, 
-                                  log_path = f"{base_dir}/benchmark/graph_retrieval/{qa_name}_{time.time()}_benchmark.log")
-            logger.info(f"INFERENCE CONFIG: {inference_config}")
-            logger.info(f"BENCHMARK CONFIG: {benchmark_config}")
+                                  log_path = f"{base_dir}/benchmark/text_retrieval/{qa_name}_{time.time()}_benchmark.log")
             if args.use_upperbound:
                 from atlas_rag.retriever.upper_bound_retriever import UpperBoundRetriever
                 upperbound_retriever = UpperBoundRetriever()
@@ -170,26 +166,25 @@ def main():
                 benchmark = RAGBenchmark(config=benchmark_config, logger=logger)
                 benchmark.run([dense_retriever], llm_generator=llm_generator)
             elif not args.use_upperbound and not args.use_dense_only:
-                tog_retriever = TogV3Retriever(
+                # Initialize HippoRAG2Retriever
+                hipporag2_retriever = HippoRAG2Retriever(
                     llm_generator=llm_generator,
                     sentence_encoder=sentence_encoder,
                     data=data,
                     inference_config=inference_config,
-                    )
-                graph_retriever = SimpleGraphRetriever(
+                    logger=logger
+                )
+                hipporag_retriever = HippoRAGRetriever(
                     llm_generator=llm_generator,
                     sentence_encoder=sentence_encoder,
                     data=data,
+                    logger=logger,
+                    inference_config=inference_config,
                 )
-                
-                subgraph_retriever = SubgraphRetriever(
-                    llm_generator=llm_generator,
-                    sentence_encoder=sentence_encoder,
-                    data=data,
-                )
+
                 # Start benchmarking
                 benchmark = RAGBenchmark(config=benchmark_config, logger=logger)
-                benchmark.run([tog_retriever, graph_retriever, subgraph_retriever], 
+                benchmark.run([hipporag_retriever, hipporag2_retriever], 
                             llm_generator=llm_generator)
 
 if __name__ == "__main__":
