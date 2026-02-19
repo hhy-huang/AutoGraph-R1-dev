@@ -194,6 +194,10 @@ class RolloutConfig(BaseConfig):
 
     sglang_engine_mode: str = "local"
 
+    # AutoGraph work mode: "autograph" for graph construction, "autorefine" for graph refinement
+    # This is separate from the rollout mode (sync/async) used for registry lookup
+    autograph_mode: Optional[str] = None
+
     limit_images: Optional[int] = None
 
     skip_tokenizer_init: bool = False
