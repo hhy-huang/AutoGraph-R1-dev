@@ -17,10 +17,11 @@ actor_rollout_ref:
   hybrid_engine: True
   rollout:
     name: sglang_async
+    autograph_mode: null  # Set to "autograph" or "autorefine" for AutoGraph work mode
     multi_turn:
       enable: True
     use_api: True
-    rag_method: subgraph
+    rag_method: re_edge  # subgraph by default
     text_linking: False
     freeze_answer_api: False
     set_llm_judge_model: False

@@ -1,0 +1,13 @@
+interaction:
+  - name: "graph_refinement"
+    class_name: "verl.interactions.refinement_interaction.RefinementInteraction"
+    config:
+      config_path: "verl/third_party/autograph_r1/config.ini"
+      base_top_k: 10
+      max_hops: 5
+      max_triple_num: 20
+      history_horizon_size: 2
+  - name: "graph_construction"
+    class_name: "verl.interactions.rag_interaction.RAGInteraction"
+    config: 
+      config_path: "verl/third_party/autograph_r1/config.ini"
