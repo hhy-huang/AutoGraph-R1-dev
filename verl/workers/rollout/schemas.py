@@ -430,6 +430,20 @@ class AsyncRolloutRequest(BaseModel):
             )[..., self.base_conv_with_gen_prompt_end_pos :]
         self._update_input_ids(processing_class, content_ids, attention_mask=True, loss_mask=False)
         
+    def add_system_message(
+        self,
+        processing_class: PreTrainedTokenizer | PreTrainedTokenizerFast | ProcessorMixin,
+        content: str,
+    ) -> None:
+        """
+        Add a new system message to the messages list.
+        This allows recording different system messages for different turns.
+        Note: Chat templates typically only use the first system message, but this preserves history.
+        """
+        self.messages.append(Message(role="system", content=content))
+        # Note: We don't update input_ids here because system messages are typically
+        # only used during full message tokenization (in get_generation_prompt_ids)
+    
     def add_tool_response_messages(
         self,
         processing_class: PreTrainedTokenizer | PreTrainedTokenizerFast | ProcessorMixin,
