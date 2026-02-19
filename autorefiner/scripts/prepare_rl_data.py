@@ -94,7 +94,11 @@ async def retrieve_subgraph(retriever, question, base_top_k=10):
         loop = asyncio.get_event_loop()
         sorted_context, sorted_context_ids = await loop.run_in_executor(None, retrieve_func)
         
-        # Convert to triple dict format
+        # Format triples as newline-separated string (same as reafiner.py line 219)
+        # sorted_context is already a list of strings like ["subject1  relation1  object1", ...]
+        triples_string = "\n".join(sorted_context)
+        
+        # Convert to triple dict format for potential future use
         retrieved_subgraph = []
         for triple_str in sorted_context:
             parts = triple_str.split("  ")
@@ -105,14 +109,11 @@ async def retrieve_subgraph(retriever, question, base_top_k=10):
                     "object": parts[2]
                 })
         
-        # Format triples as JSON string
-        triples_string = format_triples_string(retrieved_subgraph)
-        
         return triples_string, retrieved_subgraph
     except Exception as e:
         print(f"Error retrieving subgraph for question '{question}': {e}")
         # Return empty subgraph on error
-        return "[]", []
+        return "", []
 
 
 async def process_row(row, row_index, retriever, base_top_k=10):
@@ -169,7 +170,9 @@ async def process_row(row, row_index, retriever, base_top_k=10):
             "user": REAFINER_KG_REFINEMENT_ACTION_USER_PROMPT.strip()
         }
     }
-    
+
+    interaction_kwargs.update(prompt_templates)
+
     # build new extra_info
     new_extra_info = {
         "index": str(row_index),
@@ -300,8 +303,10 @@ async def process_batch(rows_batch, retriever, base_top_k=10, semaphore=None):
 
 
 async def main_async():
-    input_file = "/data/haoyuhuang/data/AtlasTune/data/mixed_hotpot_musique_train_doc_size_15_distract_False_iterate.parquet"
-    output_file = "/data/haoyuhuang/data/AtlasTune/data/mixed_hotpot_musique_train_doc_size_15_distract_False_iterate_refinement.parquet"
+    input_file = "/data/haoyuhuang/data/AtlasTune/data/mixed_hotpot_musique_valid_doc_size_15_distract_False_iterate.parquet"
+    output_file = "/data/haoyuhuang/data/AtlasTune/data/mixed_hotpot_musique_valid_doc_size_15_distract_False_iterate_refinement.parquet"
+    # input_file = "/data/haoyuhuang/data/AtlasTune/data/mixed_hotpot_musique_train_doc_size_15_distract_False_iterate.parquet"
+    # output_file = "/data/haoyuhuang/data/AtlasTune/data/mixed_hotpot_musique_train_doc_size_15_distract_False_iterate_refinement.parquet"
     pkl_path = "/data/haoyuhuang/data/AtlasTune/checkpoints/20251211_234743_qwen2.5-3B-autograph-easy-docsize15-textlinkingFalse-loose/global_step_350/actor/huggingface/constructed_kg/hotpotqa_output/original_kg.pkl"
     base_top_k = 10  # Top K for first hop retrieval
     batch_size = 50  # Process rows in batches
