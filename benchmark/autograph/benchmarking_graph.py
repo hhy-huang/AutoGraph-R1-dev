@@ -21,11 +21,11 @@ argparser.add_argument("--use_upperbound", action="store_true", help="Use upperb
 # set store true if using dense retrieval only
 argparser.add_argument("--use_dense_only", action="store_true", help="Use dense retrieval only")
 args = argparser.parse_args()
-kg_names = ["2wikimultihopqa","musique", 'hotpotqa', '2021wiki']
+# kg_names = ["2wikimultihopqa","musique", 'hotpotqa', '2021wiki']
 # kg_names = ['2021wiki']
-# kg_names = ['hotpotqa']
-# kg_names = ['2wikimultihopqa']
-# kg_names = ['musique']
+kg_names = ['hotpotqa']
+# kg_names = ['2021wiki']
+# kg_names = ['2021wiki']
 def main():
     for kg_name in kg_names:
         # Load SentenceTransformer model
@@ -46,7 +46,7 @@ def main():
         checkpoint_path = args.model_name
         if checkpoint_path == "Qwen/Qwen2.5-3B-Instruct" or checkpoint_path == "Qwen/Qwen2.5-7B-Instruct" or checkpoint_path == 'meta-llama/Llama-3.2-3B-Instruct' or checkpoint_path == 'meta-llama/Llama-3.2-1B-Instruct':
         # get the name after '/'
-            output_directory = f'/data/tht/AutoGraph-R1/checkpoints/{checkpoint_path.split("/")[-1]}/constructed_kg/{kg_name}_output'
+            output_directory = f'/data/haoyuhuang/data/AtlasTune/checkpoints/{checkpoint_path.split("/")[-1]}/constructed_kg/{kg_name}_output'
         else:
             output_directory = f'{checkpoint_path}/constructed_kg/{kg_name}_output'
         if not args.use_upperbound:
@@ -77,13 +77,13 @@ def main():
                 base_dir = base_dir + "_dense"
             benchmark_config = BenchMarkConfig(
                 dataset_name=qa_name,
-                question_file=f"/home/tht/AutoGraph-R1/benchmark/{qa_name}.json",
+                question_file=f"/home/haoyuhuang/www/code/AutoGraph-R1-dev/benchmark/{qa_name}.json",
                 result_dir=f"{base_dir}/benchmark/graph_retrieval",
                 include_concept=False,
                 include_events=False,
                 reader_model_name=reader_model_name,
                 encoder_model_name=encoder_model_name,
-                number_of_samples=-1,  # -1 for all samples
+                number_of_samples=100,  # -1 for all samples
                 upper_bound_mode=args.use_upperbound,
                 topN=10
             )
