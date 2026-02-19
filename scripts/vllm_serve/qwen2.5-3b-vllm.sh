@@ -8,4 +8,4 @@ CUDA_VISIBLE_DEVICES=0 vllm serve Qwen/Qwen2.5-3B-Instruct \
   --port 8129 \
   --gpu-memory-utilization 0.78 \
   --tensor-parallel-size 1 \
-  --max-model-len 8192
+  --max-model-len 16384
