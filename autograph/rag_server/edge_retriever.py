@@ -63,7 +63,7 @@ class EdgeRetriever(BaseRetriever):
         edge_str_lst = []
         for src, dst in top_edges:
             relation = self.KG.edges[src, dst]['relation']
-            edge_str_lst.append(f"({src}-{relation}->{dst})")
+            edge_str_lst.append(f"({self.KG.nodes[src]['id']}-{relation}->{self.KG.nodes[dst]['id']})")
         edge_str = "\n".join(edge_str_lst)
         # Generate answer using the subgraph (or full KG)
         answer = await self.generate_answer(question, edge_str)
@@ -83,9 +83,9 @@ class EdgeRetriever(BaseRetriever):
         messages.append({"role": "user", "content": f"{edge_str}\n\n{query}"})
         generated_text = await self.llm_generator.generate_response(messages, **self.sampling_params)
         if "Answer:" in generated_text:
-            generated_text = generated_text.split("Answer:")[-1]
+            generated_text = generated_text.split("Answer:")[-1].strip()
         elif "answer:" in generated_text:
-            generated_text = generated_text.split("answer:")[-1]
+            generated_text = generated_text.split("answer:")[-1].strip()
         # if answer is none
         if not generated_text:
             return "none"
