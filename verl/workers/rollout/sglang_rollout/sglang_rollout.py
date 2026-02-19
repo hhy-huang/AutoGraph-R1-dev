@@ -20,6 +20,8 @@ import logging
 import multiprocessing as mp
 import os
 import time
+from openai import OpenAI
+from atlas_rag.vectorstore.embedding_model import Qwen3Emb
 from copy import deepcopy
 from json import JSONDecodeError
 from typing import Any, Generator, Optional
@@ -102,11 +104,15 @@ from autograph.rag_server.reranker_api import Reranker
 from autograph.rag_server.llm_api import LLMGenerator
 import json_repair
 import networkx as nx
+import pickle
 # from autograph.rag_server.rag_server import *
 
 class AutoGraphStateEnum(Enum):
     CONSTRUCTING = "constructing"
     RAG = "rag"
+    ANSWERABLE_JUDGEMENT = "answerable_judgement"
+    ABDUCTION = "abduction"
+    ACTION_GENERATION = "action_generation"
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -899,6 +905,15 @@ class SGLangRollout(BaseRollout):
         **kwargs,
     ) -> AsyncRolloutRequest:
         assert self._tp_rank == 0, "only the master process can call this function"
+        # # debug hook: attach VSCode to this Ray worker only once
+        # import debugpy, os
+        # if not getattr(self, "_debugpy_started", False):
+        #     debugpy.listen(("0.0.0.0", 5678))
+        #     print("debugpy listening", os.getpid())
+        #     self._debugpy_started = True
+        # debugpy.wait_for_client()
+        # debugpy.breakpoint()
+        
         _req = deepcopy(req)
         finish_reason_type = None
         output = None
@@ -907,28 +922,65 @@ class SGLangRollout(BaseRollout):
         user_turns = 0
         user_turn_rewards = []
 
-        rag_state = AutoGraphStateEnum.CONSTRUCTING 
-        _req.interaction_kwargs['remaining_context'] = _req.interaction_kwargs.get("full_context", [])
+        # Use autograph_mode if set, otherwise fall back to mode for backward compatibility
+        work_mode = getattr(self.config, 'autograph_mode', None) or self.config.mode
+        self.work_mode = work_mode
+        
+        if work_mode == "autograph":
+            rag_state = AutoGraphStateEnum.CONSTRUCTING 
+            _req.interaction_kwargs['remaining_context'] = _req.interaction_kwargs.get("full_context", [])
+        elif work_mode == "autorefine":
+            rag_state = AutoGraphStateEnum.ANSWERABLE_JUDGEMENT
+            _req.interaction_kwargs["full_graph_data_path"] = _req.interaction_kwargs.get("full_graph_data_path", [])
+            with open(_req.interaction_kwargs["full_graph_data_path"], "rb") as f:
+                full_graph_data = pickle.load(f)
+            _req.interaction_kwargs["full_graph_data"] = full_graph_data
+            if not hasattr(self, "_sentence_encoder_refinement") or self._sentence_encoder_refinement is None:
+                _se_client = OpenAI(base_url="http://0.0.0.0:8128/v1", api_key="EMPTY KEY")
+                self._sentence_encoder_refinement = Qwen3Emb(_se_client)
+            _req.interaction_kwargs["sentence_encoder"] = self._sentence_encoder_refinement
+        else:
+            raise ValueError(f"Invalid autograph_mode: {work_mode}. Must be 'autograph' or 'autorefine'")
         # Create request-level sampling parameters
         request_sampling_params = self.sampling_params.copy()
-        if not do_sample:
-            request_sampling_params.update(
-                {
-                    "n": 1,
-                    "presence_penalty": 0.0,
-                    "frequency_penalty": 0.0,
-                    "repetition_penalty": 1.0,
-                    "temperature": 0,
-                    "top_p": 1,
-                    "top_k": -1,
-                    "ignore_eos": False,
-                    "min_new_tokens": 0,
-                    "max_new_tokens": self.config.response_length,
-                    "skip_special_tokens": True,
-                    "spaces_between_special_tokens": True,
-                }
-            )
-        elif is_validate:
+        if not do_sample:   # True
+            if work_mode == "autograph":
+                request_sampling_params.update(
+                    {                        
+                        "n": 1,
+                        "presence_penalty": 0.0,
+                        "frequency_penalty": 0.0,
+                        "repetition_penalty": 1.0,
+                        "temperature": 0,
+                        "top_p": 1,
+                        "top_k": -1,
+                        "ignore_eos": False,
+                        "min_new_tokens": 0,
+                        "max_new_tokens": self.config.response_length,
+                        "skip_special_tokens": True,
+                        "spaces_between_special_tokens": True,
+                    }
+                )
+            elif work_mode == "autorefine":
+                request_sampling_params.update(
+                    {
+                        "n": 1,
+                        "presence_penalty": 0.0,
+                        "frequency_penalty": 0.0,
+                        "repetition_penalty": 1.0,
+                        "temperature": 0,
+                        "top_p": 1,
+                        "top_k": -1,
+                        "ignore_eos": False,
+                        "min_new_tokens": 0,
+                        "max_new_tokens": self.config.response_length,
+                        "skip_special_tokens": True,
+                        "spaces_between_special_tokens": True,
+                    }
+                )
+            else:
+                raise ValueError(f"Invalid autograph_mode: {work_mode}. Must be 'autograph' or 'autorefine'")
+        elif is_validate:   # False
             request_sampling_params.update(
                 {
                     "top_k": self.config.val_kwargs.top_k,
@@ -993,9 +1045,12 @@ class SGLangRollout(BaseRollout):
                     )
 
                 if rag_state == AutoGraphStateEnum.RAG:
+                    # KG constructed, perform RAG
                     rag_args = {}
                     output = await self._handle_rag_engine_call(_req, request_sampling_params, image_data=image_data, **rag_args)
-                else:
+                    content = output["text"]    # {"answer": "..", "edge_coverage": .., "semantic_reward": ..}
+                elif rag_state == AutoGraphStateEnum.CONSTRUCTING:
+                    # continue to perform KG construction
                     output = await self._handle_engine_call(_req, request_sampling_params, image_data=image_data)
                     if self.config.skip_tokenizer_init:
                         content_ids = output["output_ids"]
@@ -1005,8 +1060,17 @@ class SGLangRollout(BaseRollout):
                         ).unsqueeze(0)
                     else:
                         content_ids = None
-                        content = output["text"]
-                content = output["text"]
+                        content = output["text"]    # triples output
+                elif rag_state in (
+                    AutoGraphStateEnum.ANSWERABLE_JUDGEMENT,
+                    AutoGraphStateEnum.ABDUCTION,
+                    AutoGraphStateEnum.ACTION_GENERATION,
+                ):
+                    # For refinement states, the initial prompt is already in _req.messages from data preparation.
+                    # No need to inject it again - just proceed with engine call.
+                    output = await self._handle_engine_call(_req, request_sampling_params, image_data=image_data)
+                    content = output["text"]
+                # content = output["text"]
                 finish_reason_type = FinishReasonTypeEnum.from_str(output["meta_info"]["finish_reason"]["type"])
                 current_turns += 1
                 if finish_reason_type == FinishReasonTypeEnum.LENGTH:
@@ -1014,6 +1078,7 @@ class SGLangRollout(BaseRollout):
                     break
                 else:
                     if self._function_call_parser and self._function_call_parser.has_tool_call(content):
+                        # has tool call
                         finish_reason_type = FinishReasonTypeEnum.TOOL_CALL
                         _req.state = AsyncRolloutRequestStateEnum.TOOL_CALLING
                         try:
@@ -1051,10 +1116,20 @@ class SGLangRollout(BaseRollout):
                             _req.state = AsyncRolloutRequestStateEnum.COMPLETED
                             break
                     else:
+                        # no tool call
                         if rag_state == AutoGraphStateEnum.RAG:
                             _req.add_assistant_message_without_loss(self.processing_class, content)
+                        elif rag_state == AutoGraphStateEnum.CONSTRUCTING:
+                            _req.add_assistant_message(self.processing_class, content)
+                        elif rag_state in (
+                            AutoGraphStateEnum.ANSWERABLE_JUDGEMENT,
+                            AutoGraphStateEnum.ABDUCTION,
+                            AutoGraphStateEnum.ACTION_GENERATION,
+                        ):
+                            _req.add_assistant_message(self.processing_class, content)
                         else:
                             _req.add_assistant_message(self.processing_class, content)
+                        # judge whether to continue the conversation
                         if (
                             _req.interaction_kwargs
                             and self.interaction_map
@@ -1067,6 +1142,7 @@ class SGLangRollout(BaseRollout):
                             _req.state = AsyncRolloutRequestStateEnum.COMPLETED
                             break
             elif _req.state == AsyncRolloutRequestStateEnum.INTERACTING:
+                # parse the outputs
                 user_turns += 1
                 messages = [{"role": x.role, "content": x.content} for x in _req.messages]
                 # Get interaction by name from interaction_kwargs
@@ -1078,7 +1154,7 @@ class SGLangRollout(BaseRollout):
                         f"Interaction '{interaction_name}' not found in interaction_map. Available interactions: "
                         f"{list(self.interaction_map.keys())}"
                     )
-
+                # obtain the interaction instance according to the task name
                 interaction = self.interaction_map[interaction_name]
                 if self.text_linking and rag_state == AutoGraphStateEnum.CONSTRUCTING and not self.iterative:
                     # create the triples to link the title and text
@@ -1099,9 +1175,6 @@ class SGLangRollout(BaseRollout):
                         triples_list.extend(triples)
                         document_list = _req.interaction_kwargs.get("full_context", [])
                         model_tokenizer = self.processing_class  # tokenizer with .tokenize()
-                        
-                        
-
                         # preprocess documents into token counters
                         doc_tokens = [set(model_tokenizer.tokenize(doc.lower())) for doc in document_list]
 
@@ -1150,6 +1223,7 @@ class SGLangRollout(BaseRollout):
                         triples = json_repair.loads(content)
                         assert isinstance(triples, list), "triples should be a list"
                     except Exception:
+                        # parsing error, terminate
                         triples = []
                         should_terminate_sequence = True
                     if not should_terminate_sequence:
@@ -1165,23 +1239,68 @@ class SGLangRollout(BaseRollout):
                                     "doc_id": len(processed_docs),
                                 }
                         triples_list.extend(triples)
+                        # update remaining context and processed docs
                         _req.interaction_kwargs["processed_docs"] = processed_docs + [document_list[0]]
                         _req.interaction_kwargs["remaining_context"] = document_list[1:] if len(document_list) > 1 else []
-                        # save results back into kwargs
+                        # save results back into kwargs, triples_list and title_triple_dict are used in the next turn
                         _req.interaction_kwargs["title_triple_dict"] = triple_to_doc
                         _req.interaction_kwargs["triples_list"] = triples_list
                         # print(document_list)
                         # print(triple_to_doc)
+                # past messages
                 messages = [{"role": x.role, "content": x.content} for x in _req.messages]
-                should_terminate_sequence, content, reward, metrics = await interaction.generate_response(
-                    _req.request_id, messages,
-                    current_turn=user_turns,
-                    max_user_turn=self.config.multi_turn.max_user_turns,
-                    iterative=self.iterative,
-                    **_req.interaction_kwargs
-                )
+                if rag_state in (
+                    AutoGraphStateEnum.ANSWERABLE_JUDGEMENT,
+                    AutoGraphStateEnum.ABDUCTION,
+                    AutoGraphStateEnum.ACTION_GENERATION,
+                ):
+                    phase_map = {
+                        AutoGraphStateEnum.ANSWERABLE_JUDGEMENT: "answerable_judgement",
+                        AutoGraphStateEnum.ABDUCTION: "abduction",
+                        AutoGraphStateEnum.ACTION_GENERATION: "action_generation",
+                    }
+                    phase = phase_map[rag_state]
+                    should_terminate_sequence, content, reward, extra = await interaction.generate_response_refinement(
+                        _req.request_id, messages, phase, **_req.interaction_kwargs
+                    )
+                    user_turn_rewards.append(reward)
+                    if should_terminate_sequence:
+                        finish_reason_type = FinishReasonTypeEnum.STOP
+                        _req.state = AsyncRolloutRequestStateEnum.COMPLETED
+                        break
+                    if extra.get("next_system"):
+                        _req.add_system_message(self.processing_class, extra["next_system"])
+                    # _req.add_user_message(self.processing_class, content)
+                    next_rs = extra.get("next_rag_state")
+                    if next_rs == "rag":
+                        rag_state = AutoGraphStateEnum.RAG
+                        _req.interaction_kwargs["refined_kg_data"] = interaction._instance_dict[_req.request_id].get("kg")
+                    elif next_rs == "abduction":
+                        rag_state = AutoGraphStateEnum.ABDUCTION
+                    elif next_rs == "action_generation":
+                        rag_state = AutoGraphStateEnum.ACTION_GENERATION
+                    elif next_rs == "answerable_judgement":
+                        rag_state = AutoGraphStateEnum.ANSWERABLE_JUDGEMENT
+                    _req.state = AsyncRolloutRequestStateEnum.RUNNING
+                elif rag_state == AutoGraphStateEnum.CONSTRUCTING:
+                    should_terminate_sequence, content, reward, metrics = await interaction.generate_response(
+                        _req.request_id, messages,
+                        current_turn=user_turns,
+                        max_user_turn=self.config.multi_turn.max_user_turns,
+                        iterative=self.iterative,
+                        **_req.interaction_kwargs
+                    )
+                else:   # RAG state
+                    should_terminate_sequence, content, reward, metrics = await interaction.generate_response(
+                        _req.request_id, messages,
+                        current_turn=user_turns,
+                        max_user_turn=self.config.multi_turn.max_user_turns,
+                        iterative=self.iterative,
+                        **_req.interaction_kwargs
+                    )
                 is_rag = interaction._instance_dict[_req.request_id]["rag_state"]
                 user_turn_rewards.append(reward)
+                #TODO: 2026.2.6 add user and system messsages
                 if should_terminate_sequence:
                     finish_reason_type = FinishReasonTypeEnum.STOP
                     _req.state = AsyncRolloutRequestStateEnum.COMPLETED
@@ -1273,7 +1392,9 @@ class SGLangRollout(BaseRollout):
                 )
 
             interaction = self.interaction_map[interaction_name]
-            await interaction.start_interaction(_req.request_id, **interaction_kwargs)
+            # Pass initial messages to start_interaction so it can extract triples from pre-populated prompt
+            interaction_kwargs_with_messages = {**interaction_kwargs, "initial_messages": _req.messages}
+            await interaction.start_interaction(_req.request_id, **interaction_kwargs_with_messages)
 
     @GPUMemoryLogger(role="sglang rollout", logger=logger)
     @torch.no_grad()
@@ -1322,6 +1443,10 @@ class SGLangRollout(BaseRollout):
                         logger.info(f"Request {req.request_id} was cancelled, creating padding")
                         aborted_requests.append(req.request_id)
                         return self._create_padding_request(req)
+                    except Exception as e:
+                        import traceback
+                        logger.error(f"Request {req.request_id} failed with error: {e}\n{traceback.format_exc()}")
+                        raise
 
                 async def run_with_cancellation():
                     nonlocal all_tasks
@@ -1362,6 +1487,17 @@ class SGLangRollout(BaseRollout):
         if self._engine is not None and self._tp_rank == 0:
             loop = asyncio.get_event_loop()
             loop.run_until_complete(self._engine.flush_cache())
+
+        # Clean non-serializable objects from interaction_kwargs before broadcasting
+        # These objects are only needed during start_interaction, which happens before serialization
+        if sorted_output_req_list is not None:
+            for req in sorted_output_req_list:
+                if req.interaction_kwargs:
+                    # Remove sentence_encoder (Qwen3Emb contains HTTP client with thread locks that can't be pickled)
+                    req.interaction_kwargs.pop("sentence_encoder", None)
+                    # Remove full_graph_data (large object, not needed after start_interaction)
+                    # The KG is already deep-copied to interaction._instance_dict[instance_id]["kg"]
+                    req.interaction_kwargs.pop("full_graph_data", None)
 
         [sorted_output_req_list] = broadcast_pyobj(
             data=[sorted_output_req_list],
@@ -1715,9 +1851,7 @@ class SGLangRollout(BaseRollout):
 
         if self.device_mesh["infer_tp"].get_local_rank() == 0:
             await self._engine.flush_cache()
-
-
-    ####### AutoGraph-R1 Implementation #######
+    
     async def _handle_rag_engine_call(
         self, 
         _req: AsyncRolloutRequest, 
@@ -1737,208 +1871,263 @@ class SGLangRollout(BaseRollout):
         image_data: Optional[list[Any]] = None,
         **kwargs
     ) -> dict:
-        generation_prompt_ids = _req.get_generation_prompt_ids(self.processing_class)
-        max_new_tokens = min(
-            self.config.response_length, 
-            self.config.max_model_len - len(generation_prompt_ids) - 1
-        )
-        api_sampling_params = {
-            "max_new_tokens": max_new_tokens,
-            "temperature": sampling_params.get("temperature", 0.7),
-            "frequency_penalty": sampling_params.get("frequency_penalty", 0.0),
-            "return_logprob": sampling_params.get("logprobs", False),
-        }
-        question = _req.interaction_kwargs.get("question", "")
-        decomposed_queries = _req.interaction_kwargs.get("sub_queries", [])
-        messages = [{"role": x.role, "content": x.content} for x in _req.messages]
-        triples_string = ""
-        for i in range(len(messages) - 1, -1, -1):
-            item = messages[i]
-            if item.get("role") == "assistant":
-                triples_string = item.get("content")
-                break
-        
-        if self.rag_method == "subgraph":
-            has_error = False
-            if self.iterative:
-                triples_string = json.dumps(_req.interaction_kwargs.get("triples_list", ""))
-            try:
-                kg = parse_triples(triples_string)
-                if kg.number_of_edges() == 0:
-                    output_text = "Error: No valid triples found"
-                    has_error = True
-            except Exception as e:
-                output_text = "Error parsing triples"
-                has_error = True
-            
-            if not has_error:
-                from autograph.rag_server.subgraph_retriever import SubgraphRetriever
-                retriever = SubgraphRetriever(self.retriever_config, self.llm_generator, self.reranker,
-                                              set_llm_judge_model=self.set_llm_judge_model, llm_judge_generator=self.llm_judge_generator)
-                num_hop = len(_req.interaction_kwargs.get('supporting_context', []))
-                if num_hop == 0:
-                    num_hop = 3
-                if not self.tight:
-                    num_hop = 3
-                retriever.num_hop = num_hop
-                answer = await retriever.retrieve(
-                    question=question,
-                    kg=kg,
-                    sampling_params=api_sampling_params,
-                    sub_queries=decomposed_queries,
-                    answer=_req.interaction_kwargs.get("ground_truth")[0],
-                    reward_function=self.reward_function
-                )
-                output_text = answer
-        elif self.rag_method == "tog":
-            has_error = False
-            if self.iterative:
-                triples_string = json.dumps(_req.interaction_kwargs.get("triples_list", ""))
-            try:
-                kg = parse_triples(triples_string)
-                if kg.number_of_edges() == 0:
-                    output_text = "Error: No valid triples found"
-                    has_error = True
-            except Exception as e:
-                output_text = "Error parsing triples"
-                has_error = True
-            
-            if not has_error:
-                from autograph.rag_server.tog_v3 import TogV3Retriever
-                retriever = TogV3Retriever(self.retriever_config, self.llm_generator, self.reranker)
-                num_hop = len(_req.interaction_kwargs.get('supporting_context', []))
-                if num_hop == 0:
-                    num_hop = 4
-                answer = await retriever.retrieve(
-                    query=question,
-                    kg=kg,
-                    sampling_params=api_sampling_params,
-                    Dmax=num_hop,
-                    topN= num_hop,
-                    answer=_req.interaction_kwargs.get("ground_truth")[0],
-                    reward_function=self.reward_function
-                )
-                output_text = answer
-        elif self.rag_method == "edge":
-            has_error = False
-            try:
-                kg = parse_triples(triples_string)
-                if kg.number_of_edges() == 0:
-                    output_text = "Error: No valid triples found"
-                    has_error = True
-            except Exception as e:
-                output_text = "Error parsing triples"
-                has_error = True
-            
-            if not has_error:
-                from autograph.rag_server.edge_retriever import EdgeRetriever
+        # Local RAG engine call. In autorefine mode we directly run RAG on the
+        # refinement-produced KG; in autograph mode we parse triples from the
+        # assistant output and then call the appropriate retriever.
+        if self.work_mode == "autorefine":
+            # Currently only support re_edge for autorefine:
+            # use EdgeRetriever over the refined KG to both retrieve a subgraph
+            # and answer the question.
+            if self.rag_method != "re_edge":
+                raise NotImplementedError(f"autorefine work_mode only supports rag_method='re_edge', got {self.rag_method}")
+
+            # Build sampling params in the same way as autograph path.
+            generation_prompt_ids = _req.get_generation_prompt_ids(self.processing_class)
+            max_new_tokens = min(
+                self.config.response_length,
+                self.config.max_model_len - len(generation_prompt_ids) - 1,
+            )
+            api_sampling_params = {
+                "max_new_tokens": max_new_tokens,
+                "temperature": sampling_params.get("temperature", 0.7),
+                "frequency_penalty": sampling_params.get("frequency_penalty", 0.0),
+                "return_logprob": sampling_params.get("logprobs", False),
+            }
+            question = _req.interaction_kwargs.get("question", "")
+            refined_kg = _req.interaction_kwargs.get("refined_kg_data")
+
+            from autograph.rag_server.edge_retriever import EdgeRetriever
+
+            if refined_kg is None:
+                output_text = "Error: No refined KG found"
+            else:
                 retriever = EdgeRetriever(self.retriever_config, self.llm_generator, self.reranker)
                 answer = await retriever.retrieve(
                     question=question,
-                    kg=kg,
+                    kg=refined_kg,
                     sampling_params=api_sampling_params,
-                    reward_function=self.reward_function
+                    reward_function=self.reward_function,
                 )
                 output_text = answer
-        elif self.text_linking and (self.rag_method == "hipporag" or self.rag_method == "hipporag2"):
-            has_error = False
-            title_triple_dict = _req.interaction_kwargs["title_triple_dict"]
-            document_list = _req.interaction_kwargs.get("full_context", [])
-            triples_list = _req.interaction_kwargs["triples_list"]
-            try:
-                kg = parse_triples_with_texts(triples_list, title_triple_dict, document_list)
-                if kg.number_of_edges() == 0:
-                    output_text = "Error: No valid triples found"
-                    has_error = True
-            except Exception as e:
-                output_text = "Error parsing triples"
-                has_error = True
-            if not has_error:
-                if self.rag_method == "hipporag":
-                    from autograph.rag_server.hipporag1 import HippoRAGRetriever
-                    retriever = HippoRAGRetriever(self.retriever_config, self.llm_generator, self.reranker)
-                elif self.rag_method == "hipporag2":
-                    from autograph.rag_server.hipporag2 import HippoRAG2Retriever
-                    retriever = HippoRAG2Retriever(self.retriever_config, self.llm_generator, self.reranker)
-                else:
-                    raise ValueError("Invalid rag_method for text_linking")
-                supporting_context = _req.interaction_kwargs.get("supporting_context")
-                full_context = _req.interaction_kwargs.get("full_context")
-                top_n_passages = len(supporting_context) if supporting_context is not None else 5
-                if not self.tight:
-                    top_n_passages = 5
-                answer = await retriever.retrieve(
-                    question=question,
-                    kg=kg,
-                    sampling_params=api_sampling_params,
-                    supporting_context=supporting_context,
-                    full_context=full_context,
-                    top_n_passages=top_n_passages,
-                    reward_function=self.reward_function
-                )
-                output_text = answer
-        if not has_error and self.filter_repetition_rollout:
-            # add triple repetition penalty
-            title_triple_dict = _req.interaction_kwargs.get("title_triple_dict", {})
-            # get all triples from title_triple_dict
-            gen_triples = []
-            for t_idx in list(title_triple_dict.keys()):
-                triple = title_triple_dict[t_idx]["triple"]
-                # Ensure all components are strings, not lists
-                subject = str(triple['subject']) if not isinstance(triple['subject'], str) else triple['subject']
-                relation = str(triple['relation']) if not isinstance(triple['relation'], str) else triple['relation']
-                obj = str(triple['object']) if not isinstance(triple['object'], str) else triple['object']
 
-                # Only add if all components are non-empty
-                if subject and relation and obj:
-                    gen_triples.append((subject, relation, obj))
+            # For autorefine we skip triple-repetition filtering for now and just
+            # enforce a max output length similar to the autograph path.
+            finish_reason = {"type": "stop"}
+            max_output_length = self.config.response_length
+            if len(output_text) > max_output_length:
+                output_text = output_text[:max_output_length]
+                finish_reason = {"type": "length"}
 
-            # Calculate triple repetition ratio
-            if len(gen_triples) > 0:
-                unique_triples = set(gen_triples)
-                num_unique = len(unique_triples)
-                num_total = len(gen_triples)
-                repetition_ratio = (num_total - num_unique) / num_total if num_total > 0 else 0.0
-            else:
-                repetition_ratio = 0.0
-            
-            # Add repetition ratio to output_text (which should be a json form string)
-            if repetition_ratio > self.filter_repetition_threshold:
-                output_text = "Error: Excessive triple repetition detected"
-                repetition_ratio = 1.0 # since the answer will be 0 any way
-            temp_output_text_json = json_repair.loads(output_text)
-            
-            # Check if it's actually a dictionary
-            if isinstance(temp_output_text_json, dict):
-                temp_output_text_json["triple_repetition"] = repetition_ratio
-                output_text = json.dumps(temp_output_text_json)
-            else:
-                # If it's not a dict, insert the field right after the opening '{'
-                first_brace_index = output_text.find('{')
-                if first_brace_index != -1:
-                    # Insert after the opening brace
-                    output_text = (
-                        output_text[:first_brace_index + 1] + 
-                        f'"triple_repetition": {repetition_ratio}, ' + 
-                        output_text[first_brace_index + 1:]
-                    )
-
-        max_output_length = self.config.response_length
-        if len(output_text) > max_output_length:
-            # Truncate the output text to the maximum allowed length
-            output_text = output_text[:max_output_length]
-            finish_reason = {"type": "length"}  # Indicate truncation
-        else:
-            finish_reason = {"type": "stop"}  # Normal completion
-
-        output = {
-            "text": output_text,
-            "meta_info": {
-                "finish_reason": finish_reason,
-                "id": _req.request_id,
+            return {
+                "text": output_text,
+                "meta_info": {
+                    "finish_reason": finish_reason,
+                },
             }
-        }
-        return output
+
+        else:
+            generation_prompt_ids = _req.get_generation_prompt_ids(self.processing_class)
+            max_new_tokens = min(
+                self.config.response_length, 
+                self.config.max_model_len - len(generation_prompt_ids) - 1
+            )
+            api_sampling_params = {
+                "max_new_tokens": max_new_tokens,
+                "temperature": sampling_params.get("temperature", 0.7),
+                "frequency_penalty": sampling_params.get("frequency_penalty", 0.0),
+                "return_logprob": sampling_params.get("logprobs", False),
+            }
+            question = _req.interaction_kwargs.get("question", "")
+            decomposed_queries = _req.interaction_kwargs.get("sub_queries", [])
+            messages = [{"role": x.role, "content": x.content} for x in _req.messages]
+            triples_string = ""
+            for i in range(len(messages) - 1, -1, -1):
+                item = messages[i]
+                if item.get("role") == "assistant":
+                    triples_string = item.get("content")
+                    break
+            
+            if self.rag_method == "subgraph":
+                has_error = False
+                if self.iterative:
+                    triples_string = json.dumps(_req.interaction_kwargs.get("triples_list", ""))
+                try:
+                    kg = parse_triples(triples_string)
+                    if kg.number_of_edges() == 0:
+                        output_text = "Error: No valid triples found"
+                        has_error = True
+                except Exception as e:
+                    output_text = "Error parsing triples"
+                    has_error = True
+                
+                if not has_error:
+                    from autograph.rag_server.subgraph_retriever import SubgraphRetriever
+                    retriever = SubgraphRetriever(self.retriever_config, self.llm_generator, self.reranker,
+                                                set_llm_judge_model=self.set_llm_judge_model, llm_judge_generator=self.llm_judge_generator)
+                    num_hop = len(_req.interaction_kwargs.get('supporting_context', []))
+                    if num_hop == 0:
+                        num_hop = 3
+                    if not self.tight:
+                        num_hop = 3
+                    retriever.num_hop = num_hop
+                    answer = await retriever.retrieve(
+                        question=question,
+                        kg=kg,
+                        sampling_params=api_sampling_params,
+                        sub_queries=decomposed_queries,
+                        answer=_req.interaction_kwargs.get("ground_truth")[0],
+                        reward_function=self.reward_function
+                    )
+                    output_text = answer
+            elif self.rag_method == "tog":
+                has_error = False
+                if self.iterative:
+                    triples_string = json.dumps(_req.interaction_kwargs.get("triples_list", ""))
+                try:
+                    kg = parse_triples(triples_string)
+                    if kg.number_of_edges() == 0:
+                        output_text = "Error: No valid triples found"
+                        has_error = True
+                except Exception as e:
+                    output_text = "Error parsing triples"
+                    has_error = True
+                
+                if not has_error:
+                    from autograph.rag_server.tog_v3 import TogV3Retriever
+                    retriever = TogV3Retriever(self.retriever_config, self.llm_generator, self.reranker)
+                    num_hop = len(_req.interaction_kwargs.get('supporting_context', []))
+                    if num_hop == 0:
+                        num_hop = 4
+                    answer = await retriever.retrieve(
+                        query=question,
+                        kg=kg,
+                        sampling_params=api_sampling_params,
+                        Dmax=num_hop,
+                        topN= num_hop,
+                        answer=_req.interaction_kwargs.get("ground_truth")[0],
+                        reward_function=self.reward_function
+                    )
+                    output_text = answer
+            elif self.rag_method == "edge":
+                has_error = False
+                try:
+                    kg = parse_triples(triples_string)
+                    if kg.number_of_edges() == 0:
+                        output_text = "Error: No valid triples found"
+                        has_error = True
+                except Exception as e:
+                    output_text = "Error parsing triples"
+                    has_error = True
+                
+                if not has_error:
+                    from autograph.rag_server.edge_retriever import EdgeRetriever
+                    retriever = EdgeRetriever(self.retriever_config, self.llm_generator, self.reranker)
+                    answer = await retriever.retrieve(
+                        question=question,
+                        kg=kg,
+                        sampling_params=api_sampling_params,
+                        reward_function=self.reward_function
+                    )
+                    output_text = answer
+            elif self.text_linking and (self.rag_method == "hipporag" or self.rag_method == "hipporag2"):
+                has_error = False
+                title_triple_dict = _req.interaction_kwargs["title_triple_dict"]
+                document_list = _req.interaction_kwargs.get("full_context", [])
+                triples_list = _req.interaction_kwargs["triples_list"]
+                try:
+                    kg = parse_triples_with_texts(triples_list, title_triple_dict, document_list)
+                    if kg.number_of_edges() == 0:
+                        output_text = "Error: No valid triples found"
+                        has_error = True
+                except Exception as e:
+                    output_text = "Error parsing triples"
+                    has_error = True
+                if not has_error:
+                    if self.rag_method == "hipporag":
+                        from autograph.rag_server.hipporag1 import HippoRAGRetriever
+                        retriever = HippoRAGRetriever(self.retriever_config, self.llm_generator, self.reranker)
+                    elif self.rag_method == "hipporag2":
+                        from autograph.rag_server.hipporag2 import HippoRAG2Retriever
+                        retriever = HippoRAG2Retriever(self.retriever_config, self.llm_generator, self.reranker)
+                    else:
+                        raise ValueError("Invalid rag_method for text_linking")
+                    supporting_context = _req.interaction_kwargs.get("supporting_context")
+                    full_context = _req.interaction_kwargs.get("full_context")
+                    top_n_passages = len(supporting_context) if supporting_context is not None else 5
+                    if not self.tight:
+                        top_n_passages = 5
+                    answer = await retriever.retrieve(
+                        question=question,
+                        kg=kg,
+                        sampling_params=api_sampling_params,
+                        supporting_context=supporting_context,
+                        full_context=full_context,
+                        top_n_passages=top_n_passages,
+                        reward_function=self.reward_function
+                    )
+                    output_text = answer
+            if not has_error and self.filter_repetition_rollout:
+                # add triple repetition penalty
+                title_triple_dict = _req.interaction_kwargs.get("title_triple_dict", {})
+                # get all triples from title_triple_dict
+                gen_triples = []
+                for t_idx in list(title_triple_dict.keys()):
+                    triple = title_triple_dict[t_idx]["triple"]
+                    # Ensure all components are strings, not lists
+                    subject = str(triple['subject']) if not isinstance(triple['subject'], str) else triple['subject']
+                    relation = str(triple['relation']) if not isinstance(triple['relation'], str) else triple['relation']
+                    obj = str(triple['object']) if not isinstance(triple['object'], str) else triple['object']
+
+                    # Only add if all components are non-empty
+                    if subject and relation and obj:
+                        gen_triples.append((subject, relation, obj))
+
+                # Calculate triple repetition ratio
+                if len(gen_triples) > 0:
+                    unique_triples = set(gen_triples)
+                    num_unique = len(unique_triples)
+                    num_total = len(gen_triples)
+                    repetition_ratio = (num_total - num_unique) / num_total if num_total > 0 else 0.0
+                else:
+                    repetition_ratio = 0.0
+                
+                # Add repetition ratio to output_text (which should be a json form string)
+                if repetition_ratio > self.filter_repetition_threshold:
+                    output_text = "Error: Excessive triple repetition detected"
+                    repetition_ratio = 1.0 # since the answer will be 0 any way
+                temp_output_text_json = json_repair.loads(output_text)
+                
+                # Check if it's actually a dictionary
+                if isinstance(temp_output_text_json, dict):
+                    temp_output_text_json["triple_repetition"] = repetition_ratio
+                    output_text = json.dumps(temp_output_text_json)
+                else:
+                    # If it's not a dict, insert the field right after the opening '{'
+                    first_brace_index = output_text.find('{')
+                    if first_brace_index != -1:
+                        # Insert after the opening brace
+                        output_text = (
+                            output_text[:first_brace_index + 1] + 
+                            f'"triple_repetition": {repetition_ratio}, ' + 
+                            output_text[first_brace_index + 1:]
+                        )
+
+            max_output_length = self.config.response_length
+            if len(output_text) > max_output_length:
+                # Truncate the output text to the maximum allowed length
+                output_text = output_text[:max_output_length]
+                finish_reason = {"type": "length"}  # Indicate truncation
+            else:
+                finish_reason = {"type": "stop"}  # Normal completion
+
+            output = {
+                "text": output_text,
+                "meta_info": {
+                    "finish_reason": finish_reason,
+                    "id": _req.request_id,
+                }
+            }
+            return output
 
 
 def parse_triples(triples_string: str) -> nx.DiGraph:
