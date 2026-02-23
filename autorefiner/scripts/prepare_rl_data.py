@@ -1,7 +1,10 @@
 """
 prepare refinement RL training data for graph_refinement
-read data from existing parquet file, replace prompt with refinement related prompt
+Read queries from dataset under KGs path (e.g. KGs/hotpotqa/*.json or *.jsonl),
+use original_kg.pkl in the same dataset dir for retrieval, output parquet for RL.
 """
+import argparse
+import random
 import pandas as pd
 import json
 import sys
@@ -25,11 +28,91 @@ from autograph.rag_server.reafiner_prompt import (
 )
 
 # Import retriever and encoder
-from openai import OpenAI
+from openai import OpenAI, AsyncOpenAI
 from atlas_rag.vectorstore.embedding_model import Qwen3Emb
 from atlas_rag.llm_generator import LLMGenerator
 from atlas_rag.retriever.simple_retriever import SimpleGraphRetriever
 from atlas_rag.vectorstore.create_graph_index import create_embeddings_and_index
+
+# Same retriever as rollout for draft_answer (EdgeRetriever)
+from autograph.rag_server.base_retriever import RetrieverConfig
+from autograph.rag_server.edge_retriever import EdgeRetriever
+from autograph.rag_server.reranker_api import Reranker
+from autograph.rag_server.llm_api import LLMGenerator as AutographLLMGenerator
+
+
+# Default KGs base path: dataset dir = KGS_BASE / dataset_name, contains original_kg.pkl and dataset json/jsonl
+KGS_BASE = "/data/haoyuhuang/data/AtlasTune/data/KGs"
+# Key in dataset JSON/JSONL for the query text (HotpotQA/MuSiQue use "question")
+QUERY_KEY = "question"
+
+
+def load_queries_from_dataset(dataset_dir, query_key=QUERY_KEY, split=None):
+    """
+    Load query records from a dataset directory under KGs.
+    Scans for *.json and *.jsonl; each record should have query_key (e.g. "question").
+    Other keys (e.g. answer, id) are kept in the record for extra_info/ground_truth.
+
+    Args:
+        dataset_dir: Path to dataset dir, e.g. KGs/hotpotqa
+        query_key: Key for query string in each record (default "question")
+        split: If set, only load files whose name contains this (e.g. "dev", "train")
+
+    Yields:
+        dict per record: at least {query_key: str}, plus any other keys from json
+    """
+    dataset_dir = Path(dataset_dir)
+    if not dataset_dir.is_dir():
+        raise FileNotFoundError(f"Dataset dir not found: {dataset_dir}")
+
+    for ext in ("*.json", "*.jsonl"):
+        for path in sorted(dataset_dir.glob(ext)):
+            if split and split not in path.name.lower():
+                continue
+            with open(path, "r", encoding="utf-8") as f:
+                if path.suffix == ".jsonl":
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            rec = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if query_key not in rec or not rec[query_key]:
+                            continue
+                        yield rec
+                elif path.suffix == ".json":
+                    try:
+                        data = json.load(f)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(data, list):
+                        items = data
+                    elif isinstance(data, dict):
+                        items = data.get("data", data.get("questions", data.get("instances", [data])))
+                        if not isinstance(items, list):
+                            items = [items]
+                    else:
+                        continue
+                    for rec in items:
+                        if not isinstance(rec, dict) or query_key not in rec or not rec[query_key]:
+                            continue
+                        yield rec
+
+
+def find_original_kg_pkl(dataset_dir):
+    """Return path to original_kg.pkl under dataset_dir (direct or in one subdir)."""
+    dataset_dir = Path(dataset_dir)
+    direct = dataset_dir / "original_kg.pkl"
+    if direct.exists():
+        return str(direct)
+    for sub in dataset_dir.iterdir():
+        if sub.is_dir():
+            p = sub / "original_kg.pkl"
+            if p.exists():
+                return str(p)
+    return str(direct)
 
 
 def format_triples_string(triples):
@@ -116,46 +199,69 @@ async def retrieve_subgraph(retriever, question, base_top_k=10):
         return "", []
 
 
-async def process_row(row, row_index, retriever, base_top_k=10):
-    """process single row data - async version"""
-    # get extra_info
-    extra_info = row.get("extra_info", {})
-    if isinstance(extra_info, str):
-        extra_info = json.loads(extra_info)
-    elif not isinstance(extra_info, dict):
-        extra_info = {}
-    
-    # get question
-    question = extra_info.get("question", "")
-    
+async def process_row(record, row_index, retriever, base_top_k=10, full_graph_data_path=None, query_key=QUERY_KEY,
+                     edge_retriever=None, full_kg=None):
+    """
+    Process a single sample: retrieve subgraph, build judgement prompt, build extra_info.
+    If edge_retriever and full_kg are provided, use same config as rollout to get answer and set interaction_kwargs["draft_answer"].
+    """
+    # Support both parquet-style (extra_info.question) and dataset-style (top-level question/query_key)
+    question = record.get(query_key) or (isinstance(record.get("extra_info"), dict) and record["extra_info"].get("question")) or ""
+    if isinstance(record.get("extra_info"), str):
+        try:
+            ei = json.loads(record["extra_info"])
+            question = question or ei.get("question", "")
+        except Exception:
+            pass
     if not question:
-        print(f"Warning: Row {row_index} has no question, skipping...")
         return None
-    
+
     # Retrieve subgraph for the first hop (step 0) - async
     triples_string, retrieved_subgraph = await retrieve_subgraph(retriever, question, base_top_k)
-    
-    # Build judgement prompt (first answerable judgement prompt)
     judgement_prompt = build_judgement_prompt(question, triples_string)
-    
-    # build new interaction_kwargs
+
     interaction_kwargs = {
         "name": "graph_refinement",
         "question": question,
     }
-    
-    # keep necessary information from original interaction_kwargs
-    old_interaction_kwargs = extra_info.get("interaction_kwargs", {})
-    if isinstance(old_interaction_kwargs, dict):
-        if "ground_truth" in old_interaction_kwargs:
-            interaction_kwargs["ground_truth"] = old_interaction_kwargs["ground_truth"]
-        if "supporting_context" in old_interaction_kwargs:
-            interaction_kwargs["supporting_context"] = old_interaction_kwargs["supporting_context"]
-    
-    # add full_graph_data_path (pkl path)
-    interaction_kwargs["full_graph_data_path"] = "/data/haoyuhuang/data/AtlasTune/data/train_full_kg.pkl"
-    
-    # Store prompt templates in extra_info
+    if full_graph_data_path:
+        interaction_kwargs["full_graph_data_path"] = full_graph_data_path
+
+    # Draft answer: same EdgeRetriever + KG as rollout (store in interaction_kwargs["draft_answer"])
+    # if edge_retriever is not None and full_kg is not None and full_kg.number_of_edges() > 0:
+    #     try:
+    #         sampling_params = {"max_new_tokens": 512, "temperature": 0, "frequency_penalty": 0.0}
+    #         result_str = await edge_retriever.retrieve(question, kg=full_kg, sampling_params=sampling_params)
+    #         result = json.loads(result_str)
+    #         interaction_kwargs["draft_answer"] = result.get("answer", "")
+    #     except Exception as e:
+    #         print(f"Warning: draft_answer failed for row {row_index}: {e}")
+    #         interaction_kwargs["draft_answer"] = ""
+
+    # ground_truth: from parquet extra_info, or dataset json (answer / answers). Normalize to list for interaction_kwargs and reward.
+    old_interaction_kwargs = {}
+    if isinstance(record.get("extra_info"), dict):
+        old_interaction_kwargs = record["extra_info"].get("interaction_kwargs", {})
+    if isinstance(old_interaction_kwargs, dict) and "supporting_context" in old_interaction_kwargs:
+        interaction_kwargs["supporting_context"] = old_interaction_kwargs["supporting_context"]
+
+    gt_raw = None
+    if isinstance(old_interaction_kwargs, dict) and "ground_truth" in old_interaction_kwargs:
+        gt_raw = old_interaction_kwargs["ground_truth"]
+    if gt_raw is None and "answer" in record:
+        gt_raw = record["answer"]
+    if gt_raw is None and "answers" in record:
+        gt_raw = record["answers"]
+    if isinstance(gt_raw, list):
+        gt_list = [str(x).strip() for x in gt_raw if x is not None]
+    elif gt_raw is not None:
+        gt_list = [str(gt_raw).strip()]
+    else:
+        gt_list = []
+    if not gt_list:
+        gt_list = [""]  # avoid rollout .get("ground_truth")[0] IndexError
+    interaction_kwargs["ground_truth"] = gt_list
+
     prompt_templates = {
         "prompt_template_judgement": {
             "system": REAFINER_JUDGEMENT_SYSTEM_PROMPT.strip(),
@@ -170,35 +276,35 @@ async def process_row(row, row_index, retriever, base_top_k=10):
             "user": REAFINER_KG_REFINEMENT_ACTION_USER_PROMPT.strip()
         }
     }
-
     interaction_kwargs.update(prompt_templates)
 
-    # build new extra_info
     new_extra_info = {
         "index": str(row_index),
-        "need_tools_kwargs": extra_info.get("need_tools_kwargs", False),
+        "need_tools_kwargs": record.get("need_tools_kwargs", False),
         "question": question,
-        "split": extra_info.get("split", "train"),
+        "split": record.get("split", "train"),
         "interaction_kwargs": interaction_kwargs,
-        **prompt_templates  # Add prompt templates
+        **prompt_templates
     }
-    
-    # process reward_model (maybe dict or str)
-    reward_model = row.get("reward_model")
+
+    reward_model = record.get("reward_model")
     if isinstance(reward_model, str):
         try:
             reward_model = json.loads(reward_model)
-        except:
-            pass  # keep original
-    
-    # return processed data
+        except Exception:
+            reward_model = {}
+    if not isinstance(reward_model, dict):
+        reward_model = {}
+    # Reward manager reads reward_model["ground_truth"]; f1_reward expects ground_truth["target"] as list
+    reward_model["ground_truth"] = {"target": gt_list}
+
     return {
-        "data_source": row.get("data_source", "graph_refinement"),
-        "prompt": judgement_prompt,  # Only first judgement prompt
+        "data_source": record.get("data_source", "graph_refinement"),
+        "prompt": judgement_prompt,
         "ability": "graph_refinement",
-        "reward_model": reward_model,  # keep original
+        "reward_model": reward_model,
         "extra_info": new_extra_info,
-        "metadata": row.get("metadata"),
+        "metadata": record.get("metadata"),
     }
 
 
@@ -268,24 +374,47 @@ def initialize_retriever(pkl_path, encoder_base_url="http://0.0.0.0:8128/v1",
     return retriever
 
 
-async def process_batch(rows_batch, retriever, base_top_k=10, semaphore=None):
-    """Process a batch of rows asynchronously"""
+def load_full_graph_and_edge_retriever(pkl_path, encoder_base_url="http://0.0.0.0:8128/v1",
+                                       llm_base_url="http://0.0.0.0:8129/v1",
+                                       llm_model_name="Qwen/Qwen2.5-7B-Instruct"):
+    """
+    Load full_graph_data from pkl (must have "KG" key) and create EdgeRetriever with same config as rollout.
+    Returns (full_kg, edge_retriever) or (None, None) if pkl has no KG.
+    """
+    if not os.path.exists(pkl_path):
+        return None, None
+    with open(pkl_path, "rb") as f:
+        full_graph_data = pickle.load(f)
+    kg = full_graph_data.get("KG")
+    if kg is None:
+        return None, None
+    emb_client = AsyncOpenAI(base_url=encoder_base_url, api_key="EMPTY KEY")
+    reranker = Reranker(emb_client)
+    llm_client = AsyncOpenAI(base_url=llm_base_url, api_key="EMPTY KEY")
+    llm_generator = AutographLLMGenerator(llm_client, llm_model_name, backend="openai")
+    config = RetrieverConfig("re_edge")
+    edge_retriever = EdgeRetriever(config, llm_generator, reranker)
+    return kg, edge_retriever
+
+
+async def process_batch(rows_batch, retriever, base_top_k=10, semaphore=None, full_graph_data_path=None, query_key=QUERY_KEY,
+                        edge_retriever=None, full_kg=None):
+    """Process a batch of records asynchronously. Each item in rows_batch is (idx, record)."""
     tasks = []
     indices = []
     for idx, row in rows_batch:
         indices.append(idx)
         if semaphore:
-            # Use semaphore to limit concurrent requests
-            # Create a closure to capture the current row and idx
             async def process_with_semaphore(r=row, i=idx):
                 async with semaphore:
-                    return await process_row(r, i, retriever, base_top_k)
+                    return await process_row(r, i, retriever, base_top_k, full_graph_data_path, query_key,
+                                            edge_retriever=edge_retriever, full_kg=full_kg)
             tasks.append(process_with_semaphore())
         else:
-            tasks.append(process_row(row, idx, retriever, base_top_k))
-    
+            tasks.append(process_row(row, idx, retriever, base_top_k, full_graph_data_path, query_key,
+                                    edge_retriever=edge_retriever, full_kg=full_kg))
+
     results = await asyncio.gather(*tasks, return_exceptions=True)
-    
     processed_rows = []
     failed_count = 0
     for idx, result in zip(indices, results):
@@ -298,31 +427,61 @@ async def process_batch(rows_batch, retriever, base_top_k=10, semaphore=None):
             failed_count += 1
         else:
             processed_rows.append(result)
-    
     return processed_rows, failed_count
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Prepare refinement RL data from KGs dataset dir")
+    parser.add_argument("--kgs-base", type=str, default=KGS_BASE, help="Base path for KGs (e.g. .../data/KGs)")
+    parser.add_argument("--dataset", type=str, default="hotpotqa", help="Dataset name under kgs_base (e.g. hotpotqa)")
+    parser.add_argument("--split", type=str, default=None, help="Only load files containing this (e.g. dev, train). If not set, load all json/jsonl")
+    parser.add_argument("--output", type=str, default=None, help="Output parquet path. Default: {kgs_base}/{dataset}/{dataset}_{split}_refinement.parquet")
+    parser.add_argument("--query-key", type=str, default=QUERY_KEY, help="Key for query text in dataset json (default: question)")
+    parser.add_argument("--base-top-k", type=int, default=10, help="Top K for first hop retrieval")
+    parser.add_argument("--batch-size", type=int, default=50, help="Process batch size")
+    parser.add_argument("--max-concurrent", type=int, default=20, help="Max concurrent retrieval requests")
+    parser.add_argument("--no-draft-answer", action="store_true", help="Do not compute draft_answer via EdgeRetriever")
+    parser.add_argument("--train-ratio", type=float, default=0.8, help="Fraction of data for train (rest for valid). Set to 0 to disable train/valid split (single output).")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for train/valid split")
+    return parser.parse_args()
+
+
 async def main_async():
-    input_file = "/data/haoyuhuang/data/AtlasTune/data/mixed_hotpot_musique_valid_doc_size_15_distract_False_iterate.parquet"
-    output_file = "/data/haoyuhuang/data/AtlasTune/data/mixed_hotpot_musique_valid_doc_size_15_distract_False_iterate_refinement.parquet"
-    # input_file = "/data/haoyuhuang/data/AtlasTune/data/mixed_hotpot_musique_train_doc_size_15_distract_False_iterate.parquet"
-    # output_file = "/data/haoyuhuang/data/AtlasTune/data/mixed_hotpot_musique_train_doc_size_15_distract_False_iterate_refinement.parquet"
-    pkl_path = "/data/haoyuhuang/data/AtlasTune/checkpoints/20251211_234743_qwen2.5-3B-autograph-easy-docsize15-textlinkingFalse-loose/global_step_350/actor/huggingface/constructed_kg/hotpotqa_output/original_kg.pkl"
-    base_top_k = 10  # Top K for first hop retrieval
-    batch_size = 50  # Process rows in batches
-    max_concurrent = 20  # Maximum concurrent requests
-    
-    # Configuration for encoder and LLM (can be modified via environment variables)
+    args = parse_args()
+    dataset_dir = Path(args.kgs_base) / args.dataset
+    pkl_path = find_original_kg_pkl(dataset_dir)
+    if not os.path.exists(pkl_path):
+        raise FileNotFoundError(f"original_kg.pkl not found under {dataset_dir}. Expected: {pkl_path}")
+
+    out_dir = Path(args.kgs_base) / args.dataset
+    out_dir.mkdir(parents=True, exist_ok=True)
+    train_ratio = getattr(args, "train_ratio", 0.8)
+    if args.output and train_ratio <= 0:
+        output_file = args.output
+    elif not args.output:
+        suffix = f"_{args.split}" if args.split else ""
+        output_file = str(out_dir / f"{args.dataset}{suffix}_refinement.parquet")
+    else:
+        output_file = None
+
+    base_top_k = args.base_top_k
+    batch_size = args.batch_size
+    max_concurrent = args.max_concurrent
+
+    # Load query records from dataset dir (json/jsonl)
+    print(f"Loading queries from dataset dir: {dataset_dir} (split={args.split})")
+    records = list(load_queries_from_dataset(dataset_dir, query_key=args.query_key, split=args.split))
+    print(f"Loaded {len(records)} query records")
+
+    if not records:
+        print("No records found. Exiting.")
+        return
+
     encoder_base_url = os.getenv("ENCODER_BASE_URL", "http://0.0.0.0:8128/v1")
     llm_base_url = os.getenv("LLM_BASE_URL", "http://0.0.0.0:8129/v1")
     encoder_model_name = os.getenv("ENCODER_MODEL_NAME", "Qwen/Qwen3-Embedding-0.6B")
     llm_model_name = os.getenv("LLM_MODEL_NAME", "Qwen/Qwen2.5-7B-Instruct")
-    
-    print(f"Reading data from {input_file}...")
-    df = pd.read_parquet(input_file)
-    print(f"Loaded {len(df)} rows")
-    
-    # Initialize retriever (using same pattern as benchmarking_graph_refiner.py)
+
     retriever = initialize_retriever(
         pkl_path=pkl_path,
         encoder_base_url=encoder_base_url,
@@ -330,41 +489,74 @@ async def main_async():
         encoder_model_name=encoder_model_name,
         llm_model_name=llm_model_name
     )
-    
-    # Create semaphore to limit concurrent requests
     semaphore = asyncio.Semaphore(max_concurrent)
-    
-    # Process rows in batches
+
+    full_kg, edge_retriever = None, None
+    if not getattr(args, "no_draft_answer", False):
+        print("Loading full KG and EdgeRetriever for draft_answer...")
+        full_kg, edge_retriever = load_full_graph_and_edge_retriever(
+            pkl_path, encoder_base_url=encoder_base_url,
+            llm_base_url=llm_base_url, llm_model_name=llm_model_name
+        )
+        if full_kg is not None and edge_retriever is not None:
+            print("Draft answers will be computed with EdgeRetriever (same as rollout).")
+        else:
+            print("Could not load KG for draft_answer; skipping (use --no-draft-answer to suppress).")
+            full_kg, edge_retriever = None, None
+
+    rows_list = [(i, rec) for i, rec in enumerate(records)]
+    batches = [rows_list[i:i + batch_size] for i in range(0, len(rows_list), batch_size)]
+    print(f"Processing {len(batches)} batches with batch_size={batch_size}, max_concurrent={max_concurrent}")
+
     all_processed_rows = []
     total_failed = 0
-    
-    # Create batches
-    rows_list = [(idx, row) for idx, row in df.iterrows()]
-    batches = [rows_list[i:i + batch_size] for i in range(0, len(rows_list), batch_size)]
-    
-    print(f"Processing {len(batches)} batches with batch_size={batch_size}, max_concurrent={max_concurrent}")
-    
     for batch_idx, batch in enumerate(tqdm(batches, desc="Processing batches")):
-        processed_rows, failed_count = await process_batch(batch, retriever, base_top_k, semaphore)
+        processed_rows, failed_count = await process_batch(
+            batch, retriever, base_top_k, semaphore,
+            full_graph_data_path=pkl_path,
+            query_key=args.query_key,
+            edge_retriever=edge_retriever,
+            full_kg=full_kg,
+        )
         all_processed_rows.extend(processed_rows)
         total_failed += failed_count
         print(f"Batch {batch_idx + 1}/{len(batches)}: Processed {len(processed_rows)} rows, Failed {failed_count} rows")
-    
-    # save processed data
+
     print(f"\nProcessed {len(all_processed_rows)} rows successfully")
     print(f"Failed {total_failed} rows")
-    df_processed = pd.DataFrame(all_processed_rows)
-    df_processed.to_parquet(output_file, index=False)
-    print(f"Saved processed data to {output_file}")
-    
-    # print some statistics
+
+    train_ratio = getattr(args, "train_ratio", 0.82)
+    seed = getattr(args, "seed", 42)
+    if train_ratio > 0 and train_ratio < 1 and all_processed_rows:
+        random.seed(seed)
+        shuffled = list(all_processed_rows)
+        random.shuffle(shuffled)
+        n_train = max(1, int(len(shuffled) * train_ratio))
+        train_rows = shuffled[:n_train]
+        valid_rows = shuffled[n_train:]
+        for r in train_rows:
+            r["extra_info"]["split"] = "train"
+        for r in valid_rows:
+            r["extra_info"]["split"] = "valid"
+        out_dir = Path(args.kgs_base) / args.dataset
+        out_dir.mkdir(parents=True, exist_ok=True)
+        train_file = out_dir / f"{args.dataset}_train_refinement.parquet"
+        valid_file = out_dir / f"{args.dataset}_valid_refinement.parquet"
+        pd.DataFrame(train_rows).to_parquet(str(train_file), index=False)
+        pd.DataFrame(valid_rows).to_parquet(str(valid_file), index=False)
+        print(f"Saved train ({len(train_rows)} rows) to {train_file}")
+        print(f"Saved valid ({len(valid_rows)} rows) to {valid_file}")
+        print(f"Train/valid ratio: {train_ratio:.0%} / {1 - train_ratio:.0%} (seed={seed})")
+    else:
+        df_processed = pd.DataFrame(all_processed_rows)
+        out_path = output_file or str(out_dir / f"{args.dataset}_refinement.parquet")
+        df_processed.to_parquet(out_path, index=False)
+        print(f"Saved processed data to {out_path}")
     print("\nStatistics:")
-    print(f"Total rows: {len(df_processed)}")
-    print(f"Output file: {output_file}")
+    print(f"Total rows: {len(all_processed_rows)}")
 
 
 def main():
-    """Main entry point"""
     asyncio.run(main_async())
 
 
