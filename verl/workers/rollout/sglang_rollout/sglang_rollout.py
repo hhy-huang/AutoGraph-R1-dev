@@ -1332,6 +1332,13 @@ class SGLangRollout(BaseRollout):
         tool_reward_scores = dict(tool_reward_scores)
         all_rewards = {**tool_reward_scores, **{"user_turn_rewards": user_turn_rewards}}
         _req.finalize(self.processing_class, all_rewards, finish_reason_type)
+        # Release per-request interaction state to avoid CPU memory growth across steps
+        if _req.interaction_kwargs and self.interaction_map:
+            interaction_name = _req.interaction_kwargs.get("name", "gsm8k")
+            if interaction_name in self.interaction_map:
+                interaction = self.interaction_map[interaction_name]
+                if hasattr(interaction, "finalize_interaction"):
+                    await interaction.finalize_interaction(_req.request_id, **_req.interaction_kwargs)
         if self.config.calculate_log_probs:
             debug_sampling_params = {**self.sampling_params}
             debug_sampling_params["max_new_tokens"] = 0
