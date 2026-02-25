@@ -79,7 +79,7 @@ fi
 
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 
-EXPERIMENT_NAME="Qwen2.5-1.5B-refinement-rl-f1reward-hotpotqa-16-1-5"
+EXPERIMENT_NAME="Qwen2.5-3B-refinement-rl-f1reward-hotpotqa-16-1-5"
 CHECKPOINT_DIR="/data/haoyuhuang/data/AtlasTune/checkpoints/${EXPERIMENT_NAME}"
 
 if [ "$TEXT_LINKING" = "True" ]; then
@@ -109,7 +109,7 @@ python3 -m verl.trainer.main_ppo \
     data.shuffle=True \
     data.truncation='middle' \
     data.return_raw_chat=True \
-    actor_rollout_ref.model.path=Qwen/Qwen2.5-1.5B-Instruct \
+    actor_rollout_ref.model.path=Qwen/Qwen2.5-3B-Instruct \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.285 \
     actor_rollout_ref.model.use_remove_padding=True \
