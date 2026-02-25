@@ -1269,8 +1269,11 @@ class SGLangRollout(BaseRollout):
                         _req.state = AsyncRolloutRequestStateEnum.COMPLETED
                         break
                     if extra.get("next_system"):
+                        # For refinement phases, we rebuild the conversation so that the current
+                        # phase's system prompt is the active one (many chat templates only look
+                        # at the first system message). We keep only the new system + user pair.
+                        _req.messages = []
                         _req.add_system_message(self.processing_class, extra["next_system"])
-                    # _req.add_user_message(self.processing_class, content)
                     next_rs = extra.get("next_rag_state")
                     if next_rs == "rag":
                         rag_state = AutoGraphStateEnum.RAG
