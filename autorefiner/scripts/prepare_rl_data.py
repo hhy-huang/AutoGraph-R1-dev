@@ -13,6 +13,8 @@ import pickle
 import asyncio
 from pathlib import Path
 from tqdm import tqdm
+import numpy as np
+import torch
 
 # add project path (go up to project root: autorefiner/scripts -> autorefiner -> project_root)
 project_root = Path(__file__).parent.parent.parent
@@ -33,6 +35,9 @@ from atlas_rag.vectorstore.embedding_model import Qwen3Emb
 from atlas_rag.llm_generator import LLMGenerator
 from atlas_rag.retriever.simple_retriever import SimpleGraphRetriever
 from atlas_rag.vectorstore.create_graph_index import create_embeddings_and_index
+
+# token-level F1 used for filtering (same as training reward)
+from verl.third_party.autograph_r1.f1_reward import compute_f1 as token_f1
 
 # Same retriever as rollout for draft_answer (EdgeRetriever)
 from autograph.rag_server.base_retriever import RetrieverConfig
@@ -227,16 +232,19 @@ async def process_row(record, row_index, retriever, base_top_k=10, full_graph_da
     if full_graph_data_path:
         interaction_kwargs["full_graph_data_path"] = full_graph_data_path
 
-    # Draft answer: same EdgeRetriever + KG as rollout (store in interaction_kwargs["draft_answer"])
-    # if edge_retriever is not None and full_kg is not None and full_kg.number_of_edges() > 0:
-    #     try:
-    #         sampling_params = {"max_new_tokens": 512, "temperature": 0, "frequency_penalty": 0.0}
-    #         result_str = await edge_retriever.retrieve(question, kg=full_kg, sampling_params=sampling_params)
-    #         result = json.loads(result_str)
-    #         interaction_kwargs["draft_answer"] = result.get("answer", "")
-    #     except Exception as e:
-    #         print(f"Warning: draft_answer failed for row {row_index}: {e}")
-    #         interaction_kwargs["draft_answer"] = ""
+    # Draft answer: use EdgeRetriever over the full KG, but reuse a single
+    # precomputed KG index for all questions (only query embeddings vary).
+    if edge_retriever is not None:
+        try:
+            if hasattr(edge_retriever, "_cached_triple_embeddings"):
+                draft_answer = await draft_answer_with_cached_index(
+                    edge_retriever=edge_retriever,
+                    question=question,
+                )
+                interaction_kwargs["draft_answer"] = draft_answer
+        except Exception as e:
+            print(f"Warning: draft_answer failed for row {row_index}: {e}")
+            interaction_kwargs["draft_answer"] = ""
 
     # ground_truth: from parquet extra_info, or dataset json (answer / answers). Normalize to list for interaction_kwargs and reward.
     old_interaction_kwargs = {}
@@ -397,6 +405,128 @@ def load_full_graph_and_edge_retriever(pkl_path, encoder_base_url="http://0.0.0.
     return kg, edge_retriever
 
 
+async def precompute_triple_embeddings_for_edge_retriever(edge_retriever: EdgeRetriever, kg, batch_size: int = 100):
+    """
+    Precompute triple embeddings for the full KG once, and cache them on edge_retriever.
+    This mirrors EdgeRetriever.index_kg but only does the KG part (no per-query work).
+    """
+    if kg is None or kg.number_of_edges() == 0:
+        edge_retriever._cached_triple_embeddings = None
+        edge_retriever._cached_edge_list = []
+        edge_retriever._cached_kg = kg
+        return
+
+    edge_list = list(kg.edges)
+    triples = []
+    for src, dst in edge_list:
+        rel = kg.edges[src, dst].get("relation", "")
+        triples.append(f"{src} {rel} {dst}")
+
+    triple_emb_batches = []
+    for i in range(0, len(triples), batch_size):
+        batch_triples = triples[i : i + batch_size]
+        emb = await edge_retriever.reranker.embed(batch_triples)
+        triple_emb_batches.append(emb)
+
+    if triple_emb_batches:
+        triple_embeddings = torch.cat(triple_emb_batches, dim=0)
+    else:
+        triple_embeddings = torch.zeros((0, 1024))  # fallback, should not be used
+
+    edge_retriever._cached_triple_embeddings = triple_embeddings  # shape: (num_edges, dim)
+    edge_retriever._cached_edge_list = edge_list
+    edge_retriever._cached_kg = kg
+
+
+async def draft_answer_with_cached_index(
+    edge_retriever: EdgeRetriever,
+    question: str,
+    max_new_tokens: int = 512,
+    temperature: float = 0.0,
+) -> str:
+    """
+    Given a question, compute draft answer using:
+    - cached triple embeddings / KG (precomputed once)
+    - per-question query embedding + same scoring & answer generation logic
+      as EdgeRetriever.retrieve.
+    """
+    if not hasattr(edge_retriever, "_cached_triple_embeddings"):
+        return ""
+
+    triple_embeddings = edge_retriever._cached_triple_embeddings
+    edge_list = getattr(edge_retriever, "_cached_edge_list", [])
+    kg = getattr(edge_retriever, "_cached_kg", None)
+
+    if triple_embeddings is None or triple_embeddings.size(0) == 0 or kg is None:
+        return ""
+
+    # Build query instruct in the same way as EdgeRetriever.index_kg
+    task = "Given a question, retrieve the most relevant knowledge graph triple."
+    query_instruct = f"Instruct: {task}\nQuery: {question}"
+    query_embedding = await edge_retriever.reranker.embed([query_instruct])  # (1, dim)
+
+    # Score edges and select top N
+    edge_scores = query_embedding @ triple_embeddings.T  # (1, num_edges)
+    edge_scores_np = edge_scores.detach().cpu().numpy().flatten()
+    top_edge_count = min(edge_retriever.config.topN_retrieval_edges, len(edge_scores_np))
+    if top_edge_count == 0:
+        return ""
+    top_edge_indices = np.argsort(edge_scores_np)[-top_edge_count:][::-1]
+
+    edge_str_lst = []
+    for idx in top_edge_indices:
+        src, dst = edge_list[int(idx)]
+        relation = kg.edges[src, dst].get("relation", "")
+        edge_str_lst.append(f"({kg.nodes[src]['id']}-{relation}->{kg.nodes[dst]['id']})")
+    edge_str = "\n".join(edge_str_lst)
+
+    sampling_params = {"max_new_tokens": max_new_tokens, "temperature": temperature, "frequency_penalty": 0.0}
+    edge_retriever.sampling_params = sampling_params
+    answer = await edge_retriever.generate_answer(question, edge_str)
+    return answer
+
+
+def filter_rows_by_f1(rows, threshold: float = 0.9):
+    """
+    Filter out rows whose draft_answer is too close to ground truth
+    in token-level F1 (max over all targets) with score > threshold.
+    """
+    if not rows:
+        return rows, 0
+
+    kept = []
+    removed = 0
+    for r in rows:
+        extra = r.get("extra_info", {}) or {}
+        ik = extra.get("interaction_kwargs", {}) or {}
+        draft = ik.get("draft_answer", "")
+        targets = ik.get("ground_truth", [])
+
+        # Ensure types
+        if not isinstance(draft, str) or not draft.strip():
+            kept.append(r)
+            continue
+        if isinstance(targets, str):
+            targets = [targets]
+        if not isinstance(targets, list) or not targets:
+            kept.append(r)
+            continue
+
+        best_f1 = 0.0
+        for t in targets:
+            if not isinstance(t, str) or not t.strip():
+                continue
+            f1 = token_f1(draft, t)
+            if f1 > best_f1:
+                best_f1 = f1
+        if best_f1 > threshold:
+            removed += 1
+            continue
+        kept.append(r)
+
+    return kept, removed
+
+
 async def process_batch(rows_batch, retriever, base_top_k=10, semaphore=None, full_graph_data_path=None, query_key=QUERY_KEY,
                         edge_retriever=None, full_kg=None):
     """Process a batch of records asynchronously. Each item in rows_batch is (idx, record)."""
@@ -441,7 +571,18 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=50, help="Process batch size")
     parser.add_argument("--max-concurrent", type=int, default=20, help="Max concurrent retrieval requests")
     parser.add_argument("--no-draft-answer", action="store_true", help="Do not compute draft_answer via EdgeRetriever")
-    parser.add_argument("--train-ratio", type=float, default=0.8, help="Fraction of data for train (rest for valid). Set to 0 to disable train/valid split (single output).")
+    parser.add_argument(
+        "--train-ratio",
+        type=float,
+        default=0.8,
+        help="Fraction of data for train (rest for valid). Set to 0 to disable train/valid split (single output).",
+    )
+    parser.add_argument(
+        "--draft-f1-threshold",
+        type=float,
+        default=0.9,
+        help="Filter out items whose draft_answer vs ground_truth token-level F1 is higher than this threshold.",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed for train/valid split")
     return parser.parse_args()
 
@@ -499,7 +640,9 @@ async def main_async():
             llm_base_url=llm_base_url, llm_model_name=llm_model_name
         )
         if full_kg is not None and edge_retriever is not None:
-            print("Draft answers will be computed with EdgeRetriever (same as rollout).")
+            print("Precomputing KG index for draft_answer (single index, many queries)...")
+            await precompute_triple_embeddings_for_edge_retriever(edge_retriever, full_kg)
+            print("Draft answers will be computed with EdgeRetriever (same as rollout) using cached KG index.")
         else:
             print("Could not load KG for draft_answer; skipping (use --no-draft-answer to suppress).")
             full_kg, edge_retriever = None, None
@@ -525,8 +668,9 @@ async def main_async():
     print(f"\nProcessed {len(all_processed_rows)} rows successfully")
     print(f"Failed {total_failed} rows")
 
-    train_ratio = getattr(args, "train_ratio", 0.82)
+    train_ratio = getattr(args, "train_ratio", 0.8)
     seed = getattr(args, "seed", 42)
+    f1_threshold = getattr(args, "draft_f1_threshold", 0.9)
     if train_ratio > 0 and train_ratio < 1 and all_processed_rows:
         random.seed(seed)
         shuffled = list(all_processed_rows)
@@ -534,6 +678,11 @@ async def main_async():
         n_train = max(1, int(len(shuffled) * train_ratio))
         train_rows = shuffled[:n_train]
         valid_rows = shuffled[n_train:]
+
+        # 先在 train / valid 上分别按 draft_answer vs ground_truth 的 token-level F1 过滤
+        train_rows, removed_train = filter_rows_by_f1(train_rows, threshold=f1_threshold)
+        valid_rows, removed_valid = filter_rows_by_f1(valid_rows, threshold=f1_threshold)
+
         for r in train_rows:
             r["extra_info"]["split"] = "train"
         for r in valid_rows:
@@ -544,8 +693,8 @@ async def main_async():
         valid_file = out_dir / f"{args.dataset}_valid_refinement.parquet"
         pd.DataFrame(train_rows).to_parquet(str(train_file), index=False)
         pd.DataFrame(valid_rows).to_parquet(str(valid_file), index=False)
-        print(f"Saved train ({len(train_rows)} rows) to {train_file}")
-        print(f"Saved valid ({len(valid_rows)} rows) to {valid_file}")
+        print(f"Saved train ({len(train_rows)} rows, removed {removed_train} by F1>{f1_threshold}) to {train_file}")
+        print(f"Saved valid ({len(valid_rows)} rows, removed {removed_valid} by F1>{f1_threshold}) to {valid_file}")
         print(f"Train/valid ratio: {train_ratio:.0%} / {1 - train_ratio:.0%} (seed={seed})")
     else:
         df_processed = pd.DataFrame(all_processed_rows)
