@@ -178,11 +178,16 @@ class RefinementInteraction(BaseInteraction):
         if current_phase == "answerable_judgement":
             # Parse current judgement result
             judge_match = re.search(r"<judge>(.*?)</judge>", content, re.IGNORECASE | re.DOTALL)
-            answerable = False
-            if judge_match:
-                answerable = judge_match.group(1).strip().lower().startswith("yes")
-            else:
-                answerable = "yes" in (content.lower()[:200])
+            if not judge_match:
+                # Strictly require <judge>...</judge>, otherwise treat as parse failure.
+                print(
+                    f"\033[91m [instance {instance_id}] "
+                    f"[Failed to parse judgement content: missing <judge> tag]\nContent: {content} \033[0m"
+                )
+                return True, "Failed to parse judgement content.", 0.0, {}
+
+            answerable_str = judge_match.group(1).strip().lower()
+            answerable = answerable_str.startswith("yes")
 
             # Current judgement step index (1-based)
             prev_steps = sum(1 for h in inst["interaction_history"] if h.get("phase") == "judgement")
@@ -307,15 +312,25 @@ class RefinementInteraction(BaseInteraction):
 
         if current_phase == "abduction":
             print(f"\033[94m [instance {instance_id}] [Abduction] \033[0m")
+            print(f"Raw content:\n {content}")
             inst["interaction_history"].append({"phase": "abduction", "raw_response": content})
+            # Abduction phase must output <abduction>...</abduction>, otherwise treat as parse failure.
             abduction_match = re.search(r"<abduction>(.*?)</abduction>", content, re.IGNORECASE | re.DOTALL)
-            error_reason = abduction_match.group(1).strip() if abduction_match else content[:1000]
+            if not abduction_match:
+                print(
+                    f"\033[91m [instance {instance_id}] "
+                    f"[Failed to parse abduction content: missing <abduction> tag]\nContent: {content} \033[0m"
+                )
+                inst["refinement_phase"] = "action_generation"
+                return True, "Failed to parse abduction content.", 0.0, {}
+
+            error_reason = abduction_match.group(1).strip()
             inst["error_abduction_reason"] = error_reason
             inst["refinement_phase"] = "action_generation"
             triples_string = "\n".join(inst["sorted_context"]) if inst.get("sorted_context") else ""
             next_system = REAFINER_KG_REFINEMENT_ACTION_SYSTEM_PROMPT
             next_user = REAFINER_KG_REFINEMENT_ACTION_USER_PROMPT.format(
-                original_text=str(inst["sorted_context"][:5]) if inst.get("sorted_context") else "",
+                original_text=str(inst["sorted_context"]) if inst.get("sorted_context") else "",
                 triples_string=triples_string,
                 question=inst["question"],
                 error_reasons=error_reason,
@@ -326,10 +341,28 @@ class RefinementInteraction(BaseInteraction):
 
         if current_phase == "action_generation":
             print(f"\033[94m [instance {instance_id}] [Action Generation] \033[0m")
+            print(f"Raw content:\n {content}")
             inst["interaction_history"].append({"phase": "action", "raw_response": content})
+            # Action generation phase must output <refinement>...</refinement>, otherwise treat as parse failure.
             refinement_match = re.search(r"<refinement>(.*?)</refinement>", content, re.IGNORECASE | re.DOTALL)
-            if refinement_match:
+            if not refinement_match:
+                print(
+                    f"\033[91m [instance {instance_id}] "
+                    f"[Failed to parse action generation content: missing <refinement> tag]\nContent: {content} \033[0m"
+                )
+                inst["refinement_phase"] = "rag"
+                return True, "Failed to parse action generation content.", 0.0, {}
+
+            try:
                 self._apply_refinement_actions(instance_id, refinement_match.group(1).strip())
+            except Exception as e:
+                print(
+                    f"\033[91m [instance {instance_id}] "
+                    f"[Failed to apply refinement actions: {e}\nContent: {content}] \033[0m"
+                )
+                inst["refinement_phase"] = "rag"
+                return True, "Failed to apply refinement actions.", 0.0, {}
+
             inst["rag_state"] = True
             extra["next_rag_state"] = "rag"
             return False, "You will perform graph based RAG based on your constructed knowledge graph.", 1.0, extra
