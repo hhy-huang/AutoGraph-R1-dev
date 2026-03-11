@@ -26,6 +26,7 @@ kg_names = ["musique","2wikimultihopqa", 'hotpotqa', '2021wiki']
 # kg_names = ['hotpotqa']
 # kg_names = ['2wikimultihopqa']
 # kg_names = ['musique']
+#
 def main():
     for kg_name in kg_names:
         # Load SentenceTransformer model
